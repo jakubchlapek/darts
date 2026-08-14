@@ -228,6 +228,7 @@ from mlflow.utils.requirements_utils import _get_pinned_requirement
 
 import darts
 from darts import TimeSeries
+from darts.dataprocessing.encoders.encoders import SequentialEncoder
 from darts.logging import get_logger, raise_log
 from darts.metrics.utils import (
     _LabelReduction,
@@ -654,9 +655,9 @@ def _autolog(
 
         fit_args = inspect.signature(original).bind(self, *args, **kwargs).arguments
         _log_model_setup(
-            self,
-            autologging_client,
-            run_id,
+            model=self,
+            autologging_client=autologging_client,
+            run_id=run_id,
             series=fit_args["series"],
             past_covariates=fit_args.get("past_covariates"),
             future_covariates=fit_args.get("future_covariates"),
@@ -720,9 +721,9 @@ def _autolog(
 
         autologging_client = MlflowAutologgingQueueingClient()
         _log_model_setup(
-            self,
-            autologging_client,
-            active_run.info.run_id,
+            model=self,
+            autologging_client=autologging_client,
+            run_id=active_run.info.run_id,
             series=bound.arguments["series"],
             past_covariates=bound.arguments.get("past_covariates"),
             future_covariates=bound.arguments.get("future_covariates"),
@@ -747,7 +748,7 @@ def _autolog(
         if not log_metrics or active_run is None:
             return result
 
-        bound = inspect.signature(ForecastingModel.backtest).bind(self, *args, **kwargs)
+        bound = inspect.signature(original).bind(self, *args, **kwargs)
         bound.apply_defaults()
         backtest_args = bound.arguments
 
@@ -765,30 +766,30 @@ def _autolog(
     # patch `fit()` for all forecasting models
     for _, cls in _get_forecasting_models():
         safe_patch(
-            FLAVOR_NAME,
-            cls,
-            "fit",
-            _patched_fit,
+            autologging_integration=FLAVOR_NAME,
+            destination=cls,
+            function_name="fit",
+            patch_function=_patched_fit,
         )
 
     # patch `historical_forecasts()` for all forecasting models so that the
-    # N internal fit() calls don't each log, and so that retrain=True calls
+    # N internal fit() calls do not log themselves, and so that retrain=True calls
     # log model setup once
     for _, cls in _get_forecasting_models():
         safe_patch(
-            FLAVOR_NAME,
-            cls,
-            "historical_forecasts",
-            _patched_historical_forecasts,
+            autologging_integration=FLAVOR_NAME,
+            destination=cls,
+            function_name="historical_forecasts",
+            patch_function=_patched_historical_forecasts,
         )
 
     # patch `backtest()` for all forecasting models to log metric results
     for _, cls in _get_forecasting_models():
         safe_patch(
-            FLAVOR_NAME,
-            cls,
-            "backtest",
-            _patched_backtest,
+            autologging_integration=FLAVOR_NAME,
+            destination=cls,
+            function_name="backtest",
+            patch_function=_patched_backtest,
         )
 
 
@@ -830,23 +831,16 @@ def _infer_covariate_usage(
     ``False``. Fall back to call args / ``add_encoders`` / static covariates on
     ``series``, gated by ``supports_*`` / ``considers_static_covariates``.
     """
-    # encoder keys like "datetime_attribute" map to {"past": ..., "future": ...};
-    # non-dict values ("tz", "transformer") are ignored by the isinstance check
-    enc_types = {
-        cov
-        for val in (model.add_encoders or {}).values()
-        if isinstance(val, dict)
-        for cov in ("past", "future")
-        if cov in val
-    }
+    # encoders can add past and future covariates
+    encoders = _get_model_encoders(model)
     first_series = get_single_series(series)
     uses_past = model.uses_past_covariates or (
         model.supports_past_covariates
-        and (past_covariates is not None or "past" in enc_types)
+        and (past_covariates is not None or len(encoders.past_encoders) > 0)
     )
     uses_future = model.uses_future_covariates or (
         model.supports_future_covariates
-        and (future_covariates is not None or "future" in enc_types)
+        and (future_covariates is not None or len(encoders.future_encoders) > 0)
     )
     uses_static = model.uses_static_covariates or (
         first_series is not None
@@ -904,7 +898,7 @@ def _log_model_setup(
     autologging_client.set_tags(
         run_id=run_id,
         tags=_get_model_info_tags(
-            model,
+            model=model,
             series=series,
             past_covariates=past_covariates,
             future_covariates=future_covariates,
@@ -914,7 +908,7 @@ def _log_model_setup(
         autologging_client.log_params(run_id=run_id, params=model.model_params)
         mlflow.log_dict(model.model_params, "model_params.json")
         _log_series_info(
-            model,
+            model=model,
             series=series,
             past_covariates=past_covariates,
             future_covariates=future_covariates,
@@ -955,33 +949,46 @@ def _log_series_info(
         ``None``.
     """
     first_series = get_single_series(series)
+    first_past_covariates = get_single_series(past_covariates)
+    first_future_covariates = get_single_series(future_covariates)
     uses_past, uses_future, uses_static = _infer_covariate_usage(
-        model, series, past_covariates, future_covariates
+        model=model,
+        series=series,
+        past_covariates=past_covariates,
+        future_covariates=future_covariates,
     )
+
+    encoders = _get_model_encoders(model)
+    if encoders.encoding_available:
+        first_past_covariates, first_future_covariates = encoders.encode_train(
+            target=first_series,
+            past_covariates=first_past_covariates,
+            future_covariates=first_future_covariates,
+        )
+
     series_info = {
         "series": {
             "count": first_series.n_components,
             "names": first_series.components.tolist(),
         },
         "past_covariates": _extract_covariate_metadata(
-            uses_past,
-            get_single_series(past_covariates),
-            "components",
-            encoded_names=model.encoders.past_components,
+            uses=uses_past,
+            single_cov=first_past_covariates,
+            names_attr="components",
         ),
         "future_covariates": _extract_covariate_metadata(
-            uses_future,
-            get_single_series(future_covariates),
-            "components",
-            encoded_names=model.encoders.future_components,
+            uses=uses_future,
+            single_cov=first_future_covariates,
+            names_attr="components",
         ),
     }
-
     static_covariates = (
         first_series.static_covariates if first_series is not None else None
     )
     series_info["static_covariates"] = _extract_covariate_metadata(
-        uses_static, static_covariates, "columns"
+        uses=uses_static,
+        single_cov=static_covariates,
+        names_attr="columns",
     )
     if uses_static and static_covariates is not None:
         # static covariates are global (one shared row) unless there is one row
@@ -1014,7 +1021,6 @@ def _extract_covariate_metadata(
     uses: bool,
     single_cov: TimeSeries | pd.DataFrame | None,
     names_attr: str,
-    encoded_names: pd.Index | list[str] | None = None,
 ) -> dict:
     """Extract metadata for a single covariate type from its (already
     singular) value.
@@ -1029,10 +1035,6 @@ def _extract_covariate_metadata(
     names_attr : str
         Attribute holding the feature names ("components" for a
         ``TimeSeries``, "columns" for a static-covariates ``DataFrame``).
-    encoded_names
-        Additional covariate names generated by encoders (``add_encoders``),
-        appended to the names extracted from ``single_cov``. Ignored when
-        ``uses`` is ``False``.
 
     Returns
     -------
@@ -1044,8 +1046,6 @@ def _extract_covariate_metadata(
     if uses:
         info["used"] = True
         names = list(getattr(single_cov, names_attr)) if single_cov is not None else []
-        if encoded_names is not None:
-            names = names + list(encoded_names)
         info["names"] = names
         info["count"] = len(names)
 
@@ -1070,6 +1070,29 @@ def _sanitize_mlflow_key(name: str) -> str:
         A string safe for use as an MLflow metric key.
     """
     return re.sub(r"[^\w-]", "_", name)
+
+
+def _get_model_encoders(model: ForecastingModel) -> SequentialEncoder:
+    """Get the encoders for a model.
+
+    Gets either the trained encoder of a fitted model or the
+    fresh encoders of a model that has not been fitted yet.
+
+    Parameters
+    ----------
+    model
+        A Darts forecasting model instance.
+
+    Returns
+    -------
+    SequentialEncoder
+        The encoders for the model.
+    """
+    if model.add_encoders and not model.encoders.encoding_available:
+        # model has encoders but it was not fitted yet
+        return model.initialize_encoders()
+    # model has been fitted, or does not have encodings available
+    return model.encoders
 
 
 def _build_metric_keys(
