@@ -24,8 +24,8 @@ Some models have additional dependencies that are not included in the `all` inst
 
 Some optional integrations also require additional dependencies:
 
-| Integration            | Dependencies |
-|-------------------------|--------------|
+| Integration          | Dependencies |
+|----------------------|--------------|
 | `darts.utils.mlflow` | mlflow>=3.0  |
 
 

@@ -1414,7 +1414,7 @@ class TestMLflow:
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
         assert len(history) > 1, "Expected multiple per-window steps"
         steps = sorted(m.step for m in history)
-        assert steps == list(range(-len(history), 0))
+        assert steps == list(range(len(history)))
         logged = [m.value for m in sorted(history, key=lambda m: m.step)]
         np.testing.assert_allclose(logged, np.asarray(ref, dtype=float), atol=1e-5)
 
@@ -1791,16 +1791,16 @@ class TestMLflow:
 
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
         logged = {m.step: m.value for m in history}
-        assert logged == pytest.approx({-5: 1.0, -4: 2.0, -3: 6.5, -2: 12.0, -1: 17.5})
+        assert logged == pytest.approx({0: 1.0, 1: 2.0, 2: 6.5, 3: 12.0, 4: 17.5})
 
         rows = self._read_per_series_table(run.info.run_id)
         by_step = {(r["series_index"], r["step"]): r["value"] for r in rows}
-        assert by_step[(0, -5)] == pytest.approx(1.0)
-        assert by_step[(0, -1)] == pytest.approx(5.0)
-        assert by_step[(1, -3)] == pytest.approx(10.0)
-        assert by_step[(1, -1)] == pytest.approx(30.0)
-        assert (1, -5) not in by_step
-        assert (1, -4) not in by_step
+        assert by_step[(0, 0)] == pytest.approx(1.0)
+        assert by_step[(0, 4)] == pytest.approx(5.0)
+        assert by_step[(1, 2)] == pytest.approx(10.0)
+        assert by_step[(1, 4)] == pytest.approx(30.0)
+        assert (1, 0) not in by_step
+        assert (1, 1) not in by_step
 
     def test_log_backtest_metrics_aligns_last_points_only_time_axis(
         self, mlflow_tracking

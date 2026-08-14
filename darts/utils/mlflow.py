@@ -2,23 +2,168 @@
 MLflow Integration
 ------------------
 
+.. _darts-mlflow-autolog-logging:
+
 Custom MLflow model flavor for Darts forecasting models. Supports saving, loading,
 and logging any Darts ``ForecastingModel`` (statistical, ML-based, and PyTorch-based)
-to MLflow, as well as automatic logging (``autolog()``) of:
-
-- Model parameters and data metadata: The model creation parameters, target series, and covariate usage information.
-- Model storage: The trained model artifact after each ``fit()`` call when ``log_models=True`` (default ``False``).
-- Metrics:
-  - The score for each metric called inside an active MLflow run.
-  - The score(s) from a ``backtest()`` call.
-  - Per-epoch training/validation metrics for PyTorch-based models.
+to MLflow, as well as automatic logging  via ``autolog()``.
 
 See the `MLflow quickstart example <https://github.com/unit8co/darts/blob/master/examples/29-MLflow-quickstart.ipynb>`_
 for an end-to-end walkthrough.
 
-To keep auto-logged metrics comparable across runs, use the same evaluation
-time frame, forecast horizon, and evaluation start date for every
-``backtest()`` / metric call you intend to compare.
+.. dropdown:: Here's a quick start example
+
+    .. highlight:: python
+    .. code-block:: python
+
+        import os
+        import tempfile
+
+        import mlflow
+
+        import darts.metrics as metrics
+        from darts.datasets import AirPassengersDataset
+        from darts.models import LinearRegressionModel
+        from darts.utils.mlflow import autolog
+
+        # dummy temporary directory for local MLflow tracking;
+        # use a permanent location for real use cases
+        tmpdir = tempfile.mkdtemp()
+        mlflow_db = os.path.join(tmpdir, "mlflow.db")
+
+        mlflow.set_tracking_uri(f"sqlite:///{mlflow_db}")
+        mlflow.set_experiment("darts-quickstart")
+
+        # load series and create train and val splits
+        series = AirPassengersDataset().load()
+        train, val = series[:-36], series[-36:]
+
+        # two models to compare with different lookback windows
+        model_lags, names = [12, 24], ["one-year", "two-years"]
+        horizon = 12
+
+        # activate autologging and try out the models
+        autolog()
+        for lags, name in zip(model_lags, names):
+            with mlflow.start_run(run_name=name) as run:
+                model = LinearRegressionModel(lags=lags)
+                model.fit(train)  # autolog logs params and covariate metadata
+
+                # log standalone metrics from manual predictions
+                pred = model.predict(n=horizon)
+                metrics.mae(val, pred)  # time-aggregated logged as scaler metric
+                metrics.ae(val, pred)  # time-dependent logged as stepped metric
+
+                # log backtest metrics from historical forecasts over val set
+                bt = model.backtest(
+                    series=series,
+                    start=val.start_time(),
+                    retrain=False,
+                    forecast_horizon=horizon,
+                    reduction=None,  # `None` logs as stepped metric, scalar otherwise
+                    metric=[metrics.mae, metrics.rmse],
+                )
+        autolog(disable=True)
+
+        # you can launch the MLflow UI with the command below from your terminal;
+        # then open the returned address for example in a browser (similar to http://localhost:5000)
+        print(f"mlflow ui --backend-store-uri {mlflow.get_tracking_uri()}")
+
+When ``autolog()`` is enabled, the following functionalities emit detailed logs when inside
+an active MLflow run (e.g. within ``with mlflow.start_run():``):
+
+- Calling ``ForecastingModel.fit()``:
+
+  - Logs model creation parameters (``model.model_params``), both as MLflow
+    params and as a ``model_params.json`` artifact.
+  - Logs target series info and covariate usage information (past, future,
+    and static covariates) as a ``series_info.json`` artifact.
+  - Stores the trained model artifact when ``log_models=True`` (default:
+    ``False``).
+  - Logs per-epoch training and validation metrics for PyTorch-based models.
+- Calling ``ForecastingModel.historical_forecasts(retrain=True)``:
+
+  - Logs the same model creation parameters and ``series_info.json`` as
+    ``fit()`` (overwriting any prior ``fit()`` artifacts in the same run).
+  - Does not log the trained model artifact; call ``fit()``
+    or ``log_model()`` manually if needed.
+- Calling any Darts metric:
+
+  - Logs the result of that metric call as an MLflow metric. More information
+    in the notes below.
+- Calling ``ForecastingModel.backtest()``:
+
+  - Logs all evaluation metrics under ``backtest_*`` keys. More information
+    in the notes below.
+
+.. important::
+
+    **Cross-Model Run Comparability**: Metric values are only comparable
+    across runs when the evaluation settings match. Use the same evaluation
+    time frame, forecast horizon, and evaluation start date for every
+    ``backtest()`` / metric call you intend to compare.
+
+.. note::
+
+    **Metric Naming Convention**: Logged metric keys follow the pattern
+    ``{metric_name}{component}{quantile_or_label}`` (e.g.,
+    ``"mae_target0_q0_500"``), where each part is included only when the
+    corresponding axis is present:
+
+    - ``metric_name`` – the metric function name, or the ``name`` metric
+      keyword argument when provided (e.g., ``"mae"``).
+    - ``component`` – the component name: e.g., ``"_target0"`` when
+      ``component_reduction=None``.
+    - ``quantile_or_label``:
+
+      - the quantile label: e.g., ``"_q0_500"`` for quantile metrics with
+        keyword argument ``q=[0.5]``
+      - the quantile interval label: e.g., ``"_qi_80_000"`` for quantile
+        interval metrics with keyword argument ``q_interval=[(0.1, 0.9)]``
+        (80% interval between quantiles 0.1 and 0.9).
+      - the class label: e.g., ``"_label1"`` for classification metrics with
+        keyword argument ``labels`` when ``label_reduction=None``.
+
+    **Backtest metrics** are prefixed by ``"backtest_"``.
+
+.. note::
+
+    **Metric Logging and Display**: Darts offers many ways of evaluating
+    forecasting models. To offer the highest value, we adapt what is logged
+    to MLflow based on the use case scenario.
+
+    - Metric type:
+
+      - Time-aggregated metrics (e.g. ``mae()``): Logged as
+        scaler values.
+      - Per-time step metrics (e.g. ``ae()`` where ``time_reduction=None``):
+        Logged as stepped metrics (one value per step in the forecast horizon).
+    - Single or Multi-series:
+
+      - Single series: Logged as explained above.
+      - Multiple (a list of) series: When the metric's
+        ``series_reduction=None``, the logged metric is aggregated over all
+        series using autolog's ``agg_func``. The detailed per-series metrics /
+        backtest metrics are logged under a single ``metrics_per_series.json``
+        table run artifact.
+
+    - Standalone or backtest metric:
+
+      - Standalone metric: Logged as explained above.
+      - Backtest metric: If backtest's ``reduction`` is other than ``None``,
+        the windowed forecast metrics are aggregated and logged as explained
+        above. If ``None``, metrics are logged as stepped MLflow metrics.
+
+        - Time-aggregated metrics: each step represents a specifc forecast
+          (window) metric. Steps represent the historical forecast windows
+          (0, 1, ..., n_windows - 1).
+        - Per-time step metrics: each step represents a step in the forecast
+          horizon aggregated over all windows. Steps represent the steps in
+          the forecast horizon (0, 1, ..., horizon - 1).
+
+    When components are preserved (``component_reduction=None``), all
+    series scored together must have the same number of components; names
+    are taken from the first series.
 """
 
 import inspect
@@ -345,86 +490,21 @@ def autolog(
 ) -> None:
     """Enable (or disable) automatic MLflow logging for Darts.
 
-    When enabled, the following functionalities emit detailed logs:
-
-    - Calling ``ForecastingModel.fit()`` inside an active MLflow run (e.g. within
-      ``with mlflow.start_run():``); does nothing if no run is active:
-
-      - Logs model creation parameters (``model.model_params``), both as MLflow
-        params and as a ``model_params.json`` artifact.
-      - Logs target series info and covariate usage information (past, future,
-        and static covariates) as a ``series_info.json`` artifact.
-      - Stores the trained model artifact when ``log_models=True`` (default:
-        ``False``).
-      - Logs per-epoch training and validation metrics for PyTorch-based models.
-    - Calling ``ForecastingModel.historical_forecasts(retrain=True)`` inside an
-      active MLflow run; does nothing if no run is active or ``retrain`` is not
-      ``True``:
-
-      - Logs the same model creation parameters and ``series_info.json`` as
-        ``fit()`` (overwriting any prior ``fit()`` artifacts in the same run).
-      - Does not log the trained model artifact; call ``log_model()`` manually
-        if needed.
-    - Calling any Darts metric inside an active MLflow run; does nothing if no
-      run is active:
-
-      - Logs the result of that metric call as an MLflow metric. More information
-        in the notes below.
-    - Calling ``ForecastingModel.backtest()`` inside an active MLflow run; does
-      nothing if no run is active:
-
-      - Logs all evaluation metrics under ``backtest_*`` keys. More information
-        in the notes below.
-
-    .. note::
-
-        Logged metric keys follow the pattern
-        ``{metric_name}{component}{quantile_or_label}``, where each part is
-        included only when the corresponding axis is present:
-
-        - ``metric_name`` – the metric function name, or the ``name`` metric
-          keyword argument when provided.
-        - ``component`` – the component name when ``component_reduction=None``.
-        - ``quantile_or_label``, e.g.:
-
-          - ``_q0.500`` for quantile metrics with keyword argument ``q=[0.5]``
-          - ``_qi_80.000`` for quantile interval metrics with keyword argument
-            ``q_interval=[(0.1, 0.9)]`` (80% interval between quantiles 0.1 and
-            0.9).
-          - ``_label1`` for classification metrics with keyword argument
-            ``labels`` when ``label_reduction=None``.
-
-        Per-timestep metrics (``time_reduction=None``) are charted across the
-        MLflow ``step``.
-
-        When ``series_reduction`` is set on a metric call, results are already
-        aggregated across series inside the metric itself, so the
-        cross-series aggregation described below does not apply.
-
-        For a list of series, the logged metric is aggregated over all series
-        using ``agg_func``. The detailed per-series metrics / backtest metrics
-        are logged under a single ``metrics_per_series.json`` table
-        artifact.
-
-        When components are preserved (``component_reduction=None``), all
-        series scored together must have the same number of components; names
-        are taken from the first series.
-
-        Metric values are only comparable across runs when the evaluation
-        settings match. Use the same evaluation time frame, forecast horizon,
-        and evaluation start date for every ``backtest()`` / metric call you
-        intend to compare.
+    For a detailed overview of logged params, metrics, and artifacts, see
+    :ref:`the detailed documentation <darts-mlflow-autolog-logging>`.
 
     Parameters
     ----------
     log_models
-        If ``True``, log the trained model artifact after ``fit()``. Defaults to
-        ``False``.
+        If ``True``, log the trained model artifact when calling ``fit()``.
+        Defaults to ``False``.
     log_params
-        If ``True`` (default), log model creation parameters.
+        If ``True`` (default), log model creation parameters when calling
+        ``fit()`` or ``historical_forecasts()``.
     log_metrics
         If ``True`` (default), log the result of any Darts metric call made
-        inside an active MLflow run.
+        inside an active MLflow run, including standalone metric calls or via
+        backtest.
     log_torch_metrics
         If ``True`` (default), enable ``mlflow.pytorch.autolog(log_models=False)``
         around PyTorch-based model training to automatically log per-epoch
@@ -633,9 +713,7 @@ def _autolog(
         if active_run is None:
             return result
 
-        bound = inspect.signature(ForecastingModel.historical_forecasts).bind(
-            self, *args, **kwargs
-        )
+        bound = inspect.signature(original).bind(self, *args, **kwargs)
         bound.apply_defaults()
         if bound.arguments["retrain"] is not True:
             return result
@@ -1339,7 +1417,7 @@ def _log_backtest_metrics(
                         if has_time_axis:
                             step = t - t_size if t_axis_is_calendar else t
                         else:
-                            step = aligned_w - max_w_size
+                            step = aligned_w
                         value = float(canonical[w, t, c, m])
                         agg.setdefault((key, step), []).append(value)
                         rows.append({
