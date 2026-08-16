@@ -445,8 +445,8 @@ class TestMLflow:
         expected_names = model.encoders.future_components.tolist()
         assert expected_names  # sanity check: encoders actually generated something
         assert series_info["future_covariates"]["used"] is True
-        assert series_info["future_covariates"]["count"] == len(expected_names)
-        assert series_info["future_covariates"]["names"] == expected_names
+        assert series_info["future_covariates"]["count"] == 0
+        assert series_info["future_covariates"]["encodings"] == expected_names
         assert series_info["past_covariates"]["used"] is False
 
     def test_autolog_series_info_static_is_global(
@@ -464,7 +464,8 @@ class TestMLflow:
         series_info = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/series_info.json"
         )
-        assert series_info["static_covariates"]["is_global"] is True
+        assert series_info["static_covariates"]["count"] == 2
+        assert series_info["static_covariates"]["names"] == ["a", "b"]
 
         # one row per component (2 components, 2 rows) -> component-specific
         per_component_target = self.ts_multivariate.with_static_covariates(
@@ -476,7 +477,8 @@ class TestMLflow:
         series_info = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/series_info.json"
         )
-        assert series_info["static_covariates"]["is_global"] is False
+        assert series_info["static_covariates"]["count"] == 1
+        assert series_info["static_covariates"]["names"] == ["a"]
 
     def test_autolog_historical_forecasts_series_info_covariates(
         self, mlflow_tracking, autolog_context
@@ -1121,7 +1123,7 @@ class TestMLflow:
 
         ref = np.asarray(ref, dtype=float)  # shape (n_quantiles,)
         m = mlflow.get_run(run.info.run_id).data.metrics
-        for i, key in enumerate(("mql_q0_100", "mql_q0_500", "mql_q0_900")):
+        for i, key in enumerate(("mql_q0.100", "mql_q0.500", "mql_q0.900")):
             assert key in m, f"Expected quantile key {key}"
             assert m[key] == pytest.approx(ref[i], abs=1e-5)
 
@@ -1140,8 +1142,8 @@ class TestMLflow:
                 ref = dm.miw(actual, pred, q_interval=(0.1, 0.9))
 
         m = mlflow.get_run(run.info.run_id).data.metrics
-        assert "miw_qi_80_000" in m
-        assert m["miw_qi_80_000"] == pytest.approx(float(ref), abs=1e-5)
+        assert "miw_qi0.800" in m
+        assert m["miw_qi0.800"] == pytest.approx(float(ref), abs=1e-5)
 
     def test_autolog_metric_multi_series(self, mlflow_tracking, autolog_context):
         """A list of series logs the mean over series; per-series values go to a table."""
@@ -1235,7 +1237,7 @@ class TestMLflow:
         direct = mlflow.get_run(run_direct.info.run_id).data.metrics
         assert "custom" in direct
         assert "mae" not in direct, "default metric name should be replaced"
-        assert "myq_q0_500" in direct, "quantile suffix should be preserved"
+        assert "myq_q0.500" in direct, "quantile suffix should be preserved"
 
         bt = mlflow.get_run(run_bt.info.run_id).data.metrics
         assert "backtest_custom" in bt
@@ -1597,9 +1599,9 @@ class TestMLflow:
 
         m = mlflow.get_run(run.info.run_id).data.metrics
         for key in (
-            "backtest_mql_q0_100",
-            "backtest_mql_q0_500",
-            "backtest_mql_q0_900",
+            "backtest_mql_q0.100",
+            "backtest_mql_q0.500",
+            "backtest_mql_q0.900",
         ):
             assert key in m, f"Expected quantile key {key}"
             assert np.isfinite(m[key])
@@ -1879,7 +1881,7 @@ def test_infer_metric_axes_quantiles():
 
 def test_infer_metric_axes_quantile_interval():
     has_time, _, axis_labels = _infer_metric_axes(dm.iw, {"q_interval": (0.1, 0.9)})
-    assert axis_labels == ["_qi_80.000"]
+    assert axis_labels == ["_qi0.800"]
     assert has_time is True
 
 
@@ -1906,10 +1908,10 @@ def test_build_metric_keys_components_and_quantiles():
     assert c_size == 4
     assert keys == [
         [
-            "backtest_mae_temp_q0_100",
-            "backtest_mae_temp_q0_900",
-            "backtest_mae_hum_q0_100",
-            "backtest_mae_hum_q0_900",
+            "backtest_mae_temp_q0.100",
+            "backtest_mae_temp_q0.900",
+            "backtest_mae_hum_q0.100",
+            "backtest_mae_hum_q0.900",
         ],
         [
             "backtest_f1_temp_label0",
@@ -1930,7 +1932,7 @@ def test_build_metric_keys_no_components_no_prefix():
         metric_axes=metric_axes,
     )
     assert c_size == 1
-    assert keys == [["mql_q0_500"]]
+    assert keys == [["mql_q0.500"]]
 
 
 def test_flush_logged_metrics_aggregates_and_writes_table(mlflow_tracking):

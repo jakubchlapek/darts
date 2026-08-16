@@ -116,9 +116,9 @@ an active MLflow run (e.g. within ``with mlflow.start_run():``):
       ``component_reduction=None``.
     - ``quantile_or_label``:
 
-      - the quantile label: e.g., ``"_q0_500"`` for quantile metrics with
+      - the quantile label: e.g., ``"_q0.500"`` for quantile metrics with
         keyword argument ``q=[0.5]``
-      - the quantile interval label: e.g., ``"_qi_80_000"`` for quantile
+      - the quantile interval label: e.g., ``"_qi0.800"`` for quantile
         interval metrics with keyword argument ``q_interval=[(0.1, 0.9)]``
         (80% interval between quantiles 0.1 and 0.9).
       - the class label: e.g., ``"_label1"`` for classification metrics with
@@ -683,6 +683,7 @@ def _autolog(
                     registered_model_name=registered_model_name,
                     model_id=model.model_id,
                 )
+            # TODO dennis: maybe let it fail naturally?
             except Exception:
                 raise_log(
                     ValueError(
@@ -716,7 +717,7 @@ def _autolog(
 
         bound = inspect.signature(original).bind(self, *args, **kwargs)
         bound.apply_defaults()
-        if bound.arguments["retrain"] is not True:
+        if bound.arguments["retrain"] is False:
             return result
 
         autologging_client = MlflowAutologgingQueueingClient()
@@ -735,8 +736,9 @@ def _autolog(
     def _patched_backtest(original, self, *args, **kwargs):
         """Wrap ``backtest`` to log metric result(s) to the active MLflow run.
 
-        Delegates to ``_log_backtest_metrics``, which infers result shape from
-        the metric signature and logs every cell under a descriptive key.
+        Suppresses per-window metric logging. Delegates to ``_log_backtest_metrics``,
+        which infers result shape from the metric signature and logs every cell under
+        a descriptive key.
         """
         _autolog_state.in_backtest = True
         try:
@@ -763,7 +765,7 @@ def _autolog(
         autologging_client.flush(synchronous=False).await_completion()
         return result
 
-    # patch `fit()` for all forecasting models
+    # patch `fit()` to log model setup and model artifact
     for _, cls in _get_forecasting_models():
         safe_patch(
             autologging_integration=FLAVOR_NAME,
@@ -772,9 +774,8 @@ def _autolog(
             patch_function=_patched_fit,
         )
 
-    # patch `historical_forecasts()` for all forecasting models so that the
-    # N internal fit() calls do not log themselves, and so that retrain=True calls
-    # log model setup once
+    # patch `historical_forecasts()` to log model setup only once (when retrain=True);
+    # suppresses internal fit() call logging
     for _, cls in _get_forecasting_models():
         safe_patch(
             autologging_integration=FLAVOR_NAME,
@@ -783,7 +784,8 @@ def _autolog(
             patch_function=_patched_historical_forecasts,
         )
 
-    # patch `backtest()` for all forecasting models to log metric results
+    # patch `backtest()` to log backtest metrics once while suppressing per-window
+    # metric logging
     for _, cls in _get_forecasting_models():
         safe_patch(
             autologging_integration=FLAVOR_NAME,
@@ -833,6 +835,7 @@ def _infer_covariate_usage(
     """
     # encoders can add past and future covariates
     encoders = _get_model_encoders(model)
+
     first_series = get_single_series(series)
     uses_past = model.uses_past_covariates or (
         model.supports_past_covariates
@@ -923,8 +926,8 @@ def _log_series_info(
 ) -> None:
     """Log target series and covariate usage information to MLflow.
 
-    Extracts information about the target series, and about past, future,
-    and static covariates used during training and logs them as a JSON
+    Extracts information about the target series, past, future, and
+    static covariates used during training and logs them as a JSON
     artifact for easy filtering, comparison, and documentation.
 
     Logs:
@@ -951,6 +954,9 @@ def _log_series_info(
     first_series = get_single_series(series)
     first_past_covariates = get_single_series(past_covariates)
     first_future_covariates = get_single_series(future_covariates)
+    first_static_covariates = (
+        first_series.static_covariates if first_series is not None else None
+    )
     uses_past, uses_future, uses_static = _infer_covariate_usage(
         model=model,
         series=series,
@@ -958,44 +964,39 @@ def _log_series_info(
         future_covariates=future_covariates,
     )
 
+    # if available, train encoders to get past and future encodings
     encoders = _get_model_encoders(model)
     if encoders.encoding_available:
-        first_past_covariates, first_future_covariates = encoders.encode_train(
+        _ = encoders.encode_train(
             target=first_series,
             past_covariates=first_past_covariates,
             future_covariates=first_future_covariates,
         )
 
     series_info = {
-        "series": {
-            "count": first_series.n_components,
-            "names": first_series.components.tolist(),
-        },
-        "past_covariates": _extract_covariate_metadata(
-            uses=uses_past,
-            single_cov=first_past_covariates,
+        "series": _extract_data_metadata(
+            uses=True,
+            data=first_series,
             names_attr="components",
         ),
-        "future_covariates": _extract_covariate_metadata(
-            uses=uses_future,
-            single_cov=first_future_covariates,
+        "past_covariates": _extract_data_metadata(
+            uses=uses_past,
+            data=first_past_covariates,
             names_attr="components",
+            encodings=encoders.past_components,
+        ),
+        "future_covariates": _extract_data_metadata(
+            uses=uses_future,
+            data=first_future_covariates,
+            names_attr="components",
+            encodings=encoders.future_components,
+        ),
+        "static_covariates": _extract_data_metadata(
+            uses=uses_static,
+            data=first_static_covariates,
+            names_attr="columns",
         ),
     }
-    static_covariates = (
-        first_series.static_covariates if first_series is not None else None
-    )
-    series_info["static_covariates"] = _extract_covariate_metadata(
-        uses=uses_static,
-        single_cov=static_covariates,
-        names_attr="columns",
-    )
-    if uses_static and static_covariates is not None:
-        # static covariates are global (one shared row) unless there is one row
-        # per series component, in which case they are component-specific
-        series_info["static_covariates"]["is_global"] = (
-            len(static_covariates) != first_series.n_components
-        )
 
     # log complete information as JSON artifact
     mlflow.log_dict(series_info, "series_info.json")
@@ -1017,37 +1018,44 @@ def _is_torch_model(model) -> bool:
     return TORCH_AVAILABLE and isinstance(model, TorchForecastingModel)
 
 
-def _extract_covariate_metadata(
+def _extract_data_metadata(
     uses: bool,
-    single_cov: TimeSeries | pd.DataFrame | None,
+    data: TimeSeries | pd.DataFrame | None,
     names_attr: str,
+    encodings: pd.Index | None = None,
 ) -> dict:
-    """Extract metadata for a single covariate type from its (already
-    singular) value.
+    """Extract data metadata.
+
+    Encodings are logged under the "encodings" key since they are not part
+    of the input series.
 
     Parameters
     ----------
     uses
-        Whether the model uses this covariate type.
-    single_cov
-        The covariate's value for one series: a ``TimeSeries`` (past/future
-        covariates) or a static-covariates ``DataFrame``, or ``None``.
-    names_attr : str
+        Whether the model uses this data type.
+    data
+        The data from a single series: a ``TimeSeries`` (target or past/future covariates)
+        or a static-covariates ``DataFrame``, or ``None``.
+    names_attr
         Attribute holding the feature names ("components" for a
         ``TimeSeries``, "columns" for a static-covariates ``DataFrame``).
+    encodings
+        The encodings for the data: a ``pd.Index`` of encoding names, or ``None``.
 
     Returns
     -------
     dict
         Dictionary with keys: "used" (bool), "count" (int), "names" (list).
     """
-    info = {"used": False, "count": 0, "names": []}
+    info = {"used": False, "count": 0, "names": [], "encodings": []}
 
     if uses:
         info["used"] = True
-        names = list(getattr(single_cov, names_attr)) if single_cov is not None else []
+        names = list(getattr(data, names_attr)) if data is not None else []
         info["names"] = names
         info["count"] = len(names)
+        if encodings is not None:
+            info["encodings"] = list(encodings)
 
     return info
 
@@ -1055,9 +1063,9 @@ def _extract_covariate_metadata(
 def _sanitize_mlflow_key(name: str) -> str:
     """Sanitize a string for use as an MLflow metric key.
 
-    Replaces any character that is not alphanumeric, a hyphen, or an
-    underscore with an underscore, so component names become valid
-    MLflow keys.
+    Replaces any invalid character from the metric key. Valid keys may
+    only contain slashes, alphanumerics, underscores, periods, dashes,
+    and spaces.
 
     Parameters
     ----------
@@ -1069,7 +1077,7 @@ def _sanitize_mlflow_key(name: str) -> str:
     str
         A string safe for use as an MLflow metric key.
     """
-    return re.sub(r"[^\w-]", "_", name)
+    return re.sub(r"[^/\w.\- ]", "_", name)
 
 
 def _get_model_encoders(model: ForecastingModel) -> SequentialEncoder:
@@ -1122,32 +1130,31 @@ def _build_metric_keys(
     Returns
     -------
     tuple[int, list[list[str]]]
-        ``(c_size, keys)`` where ``c_size`` is
-        ``(n_components if has_comp_axis else 1) * axis_size`` and ``keys[m][c]``
-        is the sanitized key for metric ``m`` and flat component/axis index ``c``.
+        ``(n_scores, keys)`` where ``n_scores`` is
+        ``(n_components if has_comp_axis else 1) * n_labels`` and ``keys[m][c]``
+        is the sanitized key for metric ``m`` and flat index ``c``. Flat index
+        ``c`` walks axis labels innermost, then components.
     """
-    axis_size = len(metric_axes[0][2])
-    c_size = (len(components) if has_comp_axis else 1) * axis_size
+    component_names = components if has_comp_axis else [None]
+    n_labels = len(metric_axes[0][2])
+    n_scores = len(component_names) * n_labels
+
     keys: list[list[str]] = []
-    for m, metric_name in enumerate(metric_names):
-        axis_labels = metric_axes[m][2]
-        keys_m = []
-        for c in range(c_size):
-            # c is a flat index into the (n_components x axis_size) C axis:
-            # c = comp_i * axis_size + axis_idx
-            component_index, axis_idx = divmod(c, axis_size)
-            comp_part = (
-                "_" + _sanitize_mlflow_key(components[component_index])
-                if has_comp_axis
-                else ""
+    for metric_idx, metric_name in enumerate(metric_names):
+        labels = metric_axes[metric_idx][2]
+        metric_keys: list[str] = []
+        for component in component_names:
+            component_suffix = (
+                f"_{_sanitize_mlflow_key(component)}" if component is not None else ""
             )
-            keys_m.append(
-                _sanitize_mlflow_key(
-                    f"{prefix}{metric_name}{comp_part}{axis_labels[axis_idx]}"
+            for label in labels:
+                metric_keys.append(
+                    _sanitize_mlflow_key(
+                        f"{prefix}{metric_name}{component_suffix}{label}"
+                    )
                 )
-            )
-        keys.append(keys_m)
-    return c_size, keys
+        keys.append(metric_keys)
+    return n_scores, keys
 
 
 def _log_per_series_table(rows: list[dict]) -> None:
@@ -1170,7 +1177,12 @@ def _log_per_series_table(rows: list[dict]) -> None:
     """
     if not rows:
         return
-    df = pd.DataFrame(rows).sort_values(["key", "series_index", "step"])
+
+    df = pd.DataFrame(rows)
+    sort_by = ["key", "series_index", "step"]
+    if "window_index" in df.columns:
+        sort_by.append("window_index")
+    df = df.sort_values(sort_by)
     mlflow.log_table(data=df, artifact_file="metrics_per_series.json")
 
 
@@ -1251,11 +1263,21 @@ def _log_backtest_metrics(
     must have the same number of components; names are taken from the first
     series.
 
-    Series can have different lengths and intersect in different ways,
-    so the time axis is aligned from the end rather than the start: a shorter
-    series lines up on its last value instead of its first. To represent this,
-    the time axis is mapped to the MLflow ``step`` as ``t - t_size`` when
-    ``has_time_axis`` is ``True``.
+    Series can have different lengths and intersect in different ways.
+    We align the time axis from the end rather than the start: a shorter
+    series lines up on its last value instead of its first. This is an
+    assumption which does not hold true for all cases (series can also end
+    at different times).
+
+    The last step logged to MLflow represents the last window of each series.
+    There will be ``max_n_windows`` steps logged. Shorter series will not
+    contribute to the first steps. In the multi-series case, the values at the
+    same step are aggregated over all series.
+
+    For time-dependent metrics (e.g. ``ae()``), the steps represent the
+    forecast horizon rather than backteset windows. There will be
+    ``forecast_horizon`` steps logged. In the multi-series case, the values at
+    the same step are aggregated over all series.
 
     Raises
     ------
@@ -1321,24 +1343,25 @@ def _log_backtest_metrics(
     has_time_axis, has_comp_axis, _ = metric_axes[0]
 
     series = backtest_args.get("series")
+    is_single_series = get_series_seq_type(series) == SeriesType.SINGLE
+    series = series2seq(series)
+
     forecast_horizon = backtest_args.get("forecast_horizon")
     historical_forecasts = backtest_args.get("historical_forecasts")
     last_points_only = backtest_args.get("last_points_only", False)
 
-    # if last_points_only is True, has_windows will be False, so fc_hzn is not needed
+    # if last_points_only is True, has_windows will be False, so fc_hzn is not needed;
+    # otherwise, the forecast horizon is the length of one historical forecast
     if historical_forecasts is not None and not last_points_only:
         first_series_hf = (
-            historical_forecasts
-            if get_series_seq_type(series) == SeriesType.SINGLE
-            else historical_forecasts[0]
+            historical_forecasts[0] if is_single_series else historical_forecasts[0][0]
         )
-        forecast_horizon = len(first_series_hf[0])
+        forecast_horizon = len(first_series_hf)
 
-    series_seq = series2seq(series)
-    results = [result] if get_series_seq_type(series) == SeriesType.SINGLE else result
+    results = [result] if is_single_series else result
     # component names are only used when the metric preserves components
     if has_comp_axis:
-        n_components = {s.n_components for s in series_seq}
+        n_components = {s.n_components for s in series}
         if len(n_components) > 1:
             raise_log(
                 ValueError(
@@ -1354,12 +1377,12 @@ def _log_backtest_metrics(
     rows: list[dict] = []
 
     # component names/count from the first series (all series share n_components)
-    comps = series_seq[0].components.tolist()
-    c_size, base_keys = _build_metric_keys(
-        metric_names,
-        comps,
-        has_comp_axis,
-        metric_axes,
+    comps = series[0].components.tolist()
+    n_scores, base_keys = _build_metric_keys(
+        metric_names=metric_names,
+        components=comps,
+        has_comp_axis=has_comp_axis,
+        metric_axes=metric_axes,
         prefix="backtest_",
     )
 
@@ -1369,13 +1392,13 @@ def _log_backtest_metrics(
     for r in results:
         arr = np.asarray(r, dtype=float)
         # after stripping C and M axes, rest = W*T (or W or T alone)
-        rest, extra = divmod(arr.size, c_size * n_metrics)
+        rest, extra = divmod(arr.size, n_scores * n_metrics)
         if extra:
             raise_log(
                 ValueError(
                     f"Backtest metric logging failed: result size ({arr.size}) "
-                    f"is not divisible by c_size * n_metrics ({c_size} * "
-                    f"{n_metrics} = {c_size * n_metrics}). The metric output "
+                    f"is not divisible by n_scores * n_metrics ({n_scores} * "
+                    f"{n_metrics} = {n_scores * n_metrics}). The metric output "
                     "shape does not match the inferred axes."
                 )
             )
@@ -1403,7 +1426,7 @@ def _log_backtest_metrics(
         series_shapes.append((
             t_size,
             w_size,
-            arr.reshape(w_size, t_size, c_size, n_metrics),
+            arr.reshape(w_size, t_size, n_scores, n_metrics),
         ))
 
     # align the calendar-relative axes from the end
@@ -1413,7 +1436,7 @@ def _log_backtest_metrics(
     for series_index, (t_size, w_size, canonical) in enumerate(series_shapes):
         w_offset = max_w_size - w_size if has_windows else 0
         for m in range(n_metrics):
-            for c in range(c_size):
+            for c in range(n_scores):
                 key = base_keys[m][c]
                 if has_time_axis and has_windows:
                     # Keep window-level values in the detailed table, but aggregate
@@ -1457,7 +1480,7 @@ def _log_backtest_metrics(
         agg,
         agg_func=agg_func,
         table_rows=(
-            rows if len(series_seq) > 1 or (has_time_axis and has_windows) else None
+            rows if len(series) > 1 or (has_time_axis and has_windows) else None
         ),
     )
 
@@ -1507,7 +1530,7 @@ def _infer_metric_axes(metric: Callable, metric_kwargs: dict) -> tuple:
     q_interval, q = metric_kwargs.get("q_interval"), metric_kwargs.get("q")
     if "q_interval" in params and q_interval is not None:
         intervals = np.atleast_2d(np.array(q_interval, dtype=float))
-        axis_labels = [f"_qi_{100 * (hi - lo):.3f}" for lo, hi in intervals]
+        axis_labels = [f"_qi{(hi - lo):.3f}" for lo, hi in intervals]
     elif "q" in params and q is not None:
         axis_labels = [f"_q{v:.3f}" for v in np.atleast_1d(np.array(q, dtype=float))]
     elif "label_reduction" in params and getattr(metric, "__name__", ""):
@@ -1566,7 +1589,7 @@ def _log_metric_result(
     present:
 
     - ``component`` – ``_{component_name}`` when ``has_comp_axis``.
-    - ``quantile_or_label`` – e.g. ``_q0.500`` / ``_qi_80.000`` / ``_label1``.
+    - ``quantile_or_label`` – e.g. ``_q0.500`` / ``_qi0.800`` / ``_label1``.
 
     When more than one series is scored, the logged value is ``agg_func``
     applied over series for each cell, and the granular per-series breakdown
@@ -1636,7 +1659,7 @@ def _log_metric_result(
 
     # component names/count from the first series (all series share n_components)
     comps = series_seq[0].components.tolist()
-    c_size, base_keys = _build_metric_keys(
+    n_scores, base_keys = _build_metric_keys(
         [metric_name],
         comps,
         has_comp_axis,
@@ -1650,13 +1673,13 @@ def _log_metric_result(
     for r in results:
         arr = np.asarray(r, dtype=float)
         # after stripping the C axis, the remainder is the time axis (or scalar)
-        n_times, extra = divmod(arr.size, c_size)
+        n_times, extra = divmod(arr.size, n_scores)
         if extra:
             raise_log(
                 ValueError(
                     f"Metric logging failed for `{metric_name}`: result size "
                     f"({arr.size}) is not divisible by the inferred "
-                    f"component/quantile size ({c_size}). The metric output "
+                    f"component/quantile size ({n_scores}). The metric output "
                     "shape does not match the inferred axes."
                 )
             )
@@ -1675,7 +1698,7 @@ def _log_metric_result(
         else:
             t_size = 1
 
-        series_shapes.append((t_size, arr.reshape(t_size, c_size)))
+        series_shapes.append((t_size, arr.reshape(t_size, n_scores)))
 
     # agg maps (key, step) -> per-series values, aggregated into the logged metric.
     agg: dict[tuple[str, int], list[float]] = {}
@@ -1726,7 +1749,7 @@ def _mlflow_metric_callback(func, result, args, kwargs) -> None:
       argument when provided (it overrides only this token).
     - ``component`` – ``_{component_name}`` when ``component_reduction=None``.
     - ``quantile_or_label`` – quantile/interval/label suffix (e.g. ``_q0.500``,
-      ``_qi_80.000``, ``_label1``) when applicable.
+      ``_qi0.800``, ``_label1``) when applicable.
 
     When the input is a ``Sequence[TimeSeries]`` with more than one series, the
     logged value is ``autolog()``'s ``agg_func`` applied over series, and the
