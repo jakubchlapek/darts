@@ -1550,7 +1550,8 @@ class TestMLflow:
         assert len(rows) == ref.size
         for row in rows:
             assert row["key"] == "backtest_ae"
-            assert row["window_index"] in range(-len(ref), 0)
+            assert row["window_index"] in range(len(ref))
+        assert {int(r["window_index"]) for r in rows} == set(range(len(ref)))
 
     def test_autolog_backtest_historical_forecasts_horizon_inferred(
         self, mlflow_tracking, autolog_context
@@ -1772,9 +1773,10 @@ class TestMLflow:
 
     def test_log_backtest_metrics_aligns_windows_by_end_date(self, mlflow_tracking):
         """A shorter series' window axis aligns from the end, not the start,
-        so its negative steps overlap the tail of a longer series. Calls
-        _log_backtest_metrics directly with a fabricated result so the window
-        counts per series are exact."""
+        so its last windows overlap the tail of a longer series. Steps and
+        ``window_index`` are ``0 .. max_w - 1``. Calls _log_backtest_metrics
+        directly with a fabricated result so the window counts per series
+        are exact."""
         backtest_args = {
             "metric": dm.mae,
             "metric_kwargs": {},
@@ -1803,13 +1805,16 @@ class TestMLflow:
         assert by_step[(1, 4)] == pytest.approx(30.0)
         assert (1, 0) not in by_step
         assert (1, 1) not in by_step
+        for r in rows:
+            assert r["window_index"] == r["step"]
 
     def test_log_backtest_metrics_aligns_last_points_only_time_axis(
         self, mlflow_tracking
     ):
         """last_points_only stitches windows into one series scored per real
-        timestep -- a separate code path from the window-axis case above that
-        needs the same end-date alignment."""
+        timestep. Shorter series align from the end, same as the window-axis
+        case, with steps ``0 .. t_max - 1`` rather than end-relative indexes.
+        """
         backtest_args = {
             "metric": dm.ae,
             "metric_kwargs": {},
@@ -1828,7 +1833,17 @@ class TestMLflow:
 
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
         logged = {m.step: m.value for m in history}
-        assert logged == pytest.approx({-5: 1.0, -4: 2.0, -3: 6.5, -2: 12.0, -1: 17.5})
+        assert logged == pytest.approx({0: 1.0, 1: 2.0, 2: 6.5, 3: 12.0, 4: 17.5})
+
+        rows = self._read_per_series_table(run.info.run_id)
+        by_step = {(r["series_index"], r["step"]): r["value"] for r in rows}
+        assert by_step[(0, 0)] == pytest.approx(1.0)
+        assert by_step[(0, 4)] == pytest.approx(5.0)
+        assert by_step[(1, 2)] == pytest.approx(10.0)
+        assert by_step[(1, 4)] == pytest.approx(30.0)
+        assert (1, 0) not in by_step
+        assert (1, 1) not in by_step
+        assert all(pd.isna(r["window_index"]) for r in rows)
 
     @staticmethod
     def _read_per_series_table(run_id):
@@ -1898,15 +1913,16 @@ def test_build_metric_keys_components_and_quantiles():
         (False, True, ["_q0.100", "_q0.900"]),
         (False, True, ["_label0", "_label1"]),
     ]
-    c_size, keys = _build_metric_keys(
+    metric_keys = _build_metric_keys(
         ["mae", "f1"],
         ["temp", "hum"],
         has_comp_axis=True,
         metric_axes=metric_axes,
         prefix="backtest_",
     )
+    c_size = len(metric_keys[0])
     assert c_size == 4
-    assert keys == [
+    assert metric_keys == [
         [
             "backtest_mae_temp_q0.100",
             "backtest_mae_temp_q0.900",
@@ -1925,14 +1941,15 @@ def test_build_metric_keys_components_and_quantiles():
 def test_build_metric_keys_no_components_no_prefix():
     """Without components, each metric gets one key per axis label."""
     metric_axes = [(False, False, ["_q0.500"])]
-    c_size, keys = _build_metric_keys(
+    metric_keys = _build_metric_keys(
         ["mql"],
         ["ignored"],
         has_comp_axis=False,
         metric_axes=metric_axes,
     )
+    c_size = len(metric_keys[0])
     assert c_size == 1
-    assert keys == [["mql_q0.500"]]
+    assert metric_keys == [["mql_q0.500"]]
 
 
 def test_flush_logged_metrics_aggregates_and_writes_table(mlflow_tracking):

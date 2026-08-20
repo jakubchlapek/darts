@@ -1103,123 +1103,6 @@ def _get_model_encoders(model: ForecastingModel) -> SequentialEncoder:
     return model.encoders
 
 
-def _build_metric_keys(
-    metric_names: list[str],
-    components: list[str],
-    has_comp_axis: bool,
-    metric_axes: list[tuple[bool, bool, list[str]]],
-    *,
-    prefix: str = "",
-) -> tuple[int, list[list[str]]]:
-    """Build sanitized MLflow metric keys for each metric x component x axis label.
-
-    Parameters
-    ----------
-    metric_names
-        One sanitized metric-name token per metric.
-    components
-        Component names from the first series (used only when ``has_comp_axis``).
-    has_comp_axis
-        Whether components are preserved in the metric output.
-    metric_axes
-        Per-metric ``(has_time_axis, has_comp_axis, axis_labels)`` tuples from
-        ``_infer_metric_axes``. Axis size is taken from the first entry.
-    prefix
-        Optional key prefix (e.g. ``"backtest_"``).
-
-    Returns
-    -------
-    tuple[int, list[list[str]]]
-        ``(n_scores, keys)`` where ``n_scores`` is
-        ``(n_components if has_comp_axis else 1) * n_labels`` and ``keys[m][c]``
-        is the sanitized key for metric ``m`` and flat index ``c``. Flat index
-        ``c`` walks axis labels innermost, then components.
-    """
-    component_names = components if has_comp_axis else [None]
-    n_labels = len(metric_axes[0][2])
-    n_scores = len(component_names) * n_labels
-
-    keys: list[list[str]] = []
-    for metric_idx, metric_name in enumerate(metric_names):
-        labels = metric_axes[metric_idx][2]
-        metric_keys: list[str] = []
-        for component in component_names:
-            component_suffix = (
-                f"_{_sanitize_mlflow_key(component)}" if component is not None else ""
-            )
-            for label in labels:
-                metric_keys.append(
-                    _sanitize_mlflow_key(
-                        f"{prefix}{metric_name}{component_suffix}{label}"
-                    )
-                )
-        keys.append(metric_keys)
-    return n_scores, keys
-
-
-def _log_per_series_table(rows: list[dict]) -> None:
-    """Append the granular per-series metric breakdown to a single, run-wide
-    table artifact.
-
-    Each row is a single metric cell for one series, with columns ``key`` (the
-    aggregate MLflow key, without any series suffix), ``series_index``, ``step``
-    (the time or window index charted by MLflow), ``window_index`` (the source
-    backtest window, or ``None``), and ``value``. All calls within a run append
-    to the same ``metrics_per_series.json`` artifact.
-    Used when more than one series is scored, since the logged metric keys
-    only carry the aggregate over series.
-
-    Parameters
-    ----------
-    rows
-        One dict per metric cell with keys ``key``, ``series_index``, ``step``,
-        ``window_index``, and ``value``.
-    """
-    if not rows:
-        return
-
-    df = pd.DataFrame(rows)
-    sort_by = ["key", "series_index", "step"]
-    if "window_index" in df.columns:
-        sort_by.append("window_index")
-    df = df.sort_values(sort_by)
-    mlflow.log_table(data=df, artifact_file="metrics_per_series.json")
-
-
-def _flush_logged_metrics(
-    autologging_client: MlflowAutologgingQueueingClient,
-    run_id: str,
-    agg: dict[tuple[str, int], list[float]],
-    agg_func: Callable,
-    table_rows: list[dict] | None = None,
-) -> None:
-    """Aggregate per-series cells, log MLflow metrics, and optionally write the
-    per-series table artifact.
-
-    Parameters
-    ----------
-    autologging_client
-        MLflow autologging client used to queue metric writes.
-    run_id
-        ID of the active MLflow run.
-    agg
-        Map of ``(key, step) -> list of per-series float values``.
-    agg_func
-        Aggregation over the per-series values for each ``(key, step)``.
-    table_rows
-        Granular cells for ``metrics_per_series.json``. ``None`` skips writing
-        the table artifact.
-    """
-    metrics_by_step: dict[int, dict[str, float]] = {}
-    for (key, step), values in agg.items():
-        metrics_by_step.setdefault(step, {})[key] = float(agg_func(values))
-    for step, metrics in metrics_by_step.items():
-        autologging_client.log_metrics(run_id=run_id, metrics=metrics, step=step)
-
-    if table_rows is not None:
-        _log_per_series_table(table_rows)
-
-
 def _log_backtest_metrics(
     autologging_client: MlflowAutologgingQueueingClient,
     run_id: str,
@@ -1303,63 +1186,22 @@ def _log_backtest_metrics(
         single value logged for a list of series. Called as
         ``agg_func(values)`` on a list of floats.
     """
-    metric = backtest_args.get("metric")
-    metric = metric if isinstance(metric, list) else [metric]
-    metric_kwargs = backtest_args.get("metric_kwargs") or {}
-    metric_kwargs = (
-        metric_kwargs if isinstance(metric_kwargs, list) else [metric_kwargs]
-    )
-    # backtest accepts a single dict that applies to all metrics; broadcast it
-    if len(metric_kwargs) != len(metric):
-        metric_kwargs = [metric_kwargs[0]] * len(metric)
-    # the `name` entry in metric_kwargs overrides the metric-name token in the key
-    metric_names = [
-        _sanitize_mlflow_key(
-            metric_kwargs[i].get("name") or getattr(m, "__name__", f"metric_{i}")
-        )
-        for i, m in enumerate(metric)
-    ]
-    n_metrics = len(metric)
-
-    # reduction=None means no aggregation across windows -> one value per window.
-    # last_points_only collapses all windows into one TimeSeries before scoring,
-    # so there is effectively only one window regardless of reduction.
-    has_windows = backtest_args.get("reduction") is None and not backtest_args.get(
-        "last_points_only", False
-    )
-
-    # series_reduction inside the metric itself already aggregates across windows,
-    # so the result has no window axis even when backtest.reduction is None.
-    metric_0_params = inspect.signature(metric[0]).parameters
-    if "series_reduction" in metric_0_params:
-        effective_sr = metric_kwargs[0].get(
-            "series_reduction", metric_0_params["series_reduction"].default
-        )
-        if effective_sr is not None:
-            has_windows = False
-
-    # check the dim axes from the metric kwargs for each
-    metric_axes = [_infer_metric_axes(m, kw) for m, kw in zip(metric, metric_kwargs)]
+    metrics, metric_kwargs, metric_names = _normalize_backtest_metrics(backtest_args)
+    metric_axes = [_infer_metric_axes(m, kw) for m, kw in zip(metrics, metric_kwargs)]
     has_time_axis, has_comp_axis, _ = metric_axes[0]
 
     series = backtest_args.get("series")
     is_single_series = get_series_seq_type(series) == SeriesType.SINGLE
     series = series2seq(series)
-
-    forecast_horizon = backtest_args.get("forecast_horizon")
-    historical_forecasts = backtest_args.get("historical_forecasts")
-    last_points_only = backtest_args.get("last_points_only", False)
-
-    # if last_points_only is True, has_windows will be False, so fc_hzn is not needed;
-    # otherwise, the forecast horizon is the length of one historical forecast
-    if historical_forecasts is not None and not last_points_only:
-        first_series_hf = (
-            historical_forecasts[0] if is_single_series else historical_forecasts[0][0]
-        )
-        forecast_horizon = len(first_series_hf)
-
     results = [result] if is_single_series else result
-    # component names are only used when the metric preserves components
+
+    has_windows, forecast_horizon = _resolve_backtest_layout(
+        backtest_args,
+        metrics[0],
+        metric_kwargs[0],
+        is_single_series,
+    )
+
     if has_comp_axis:
         n_components = {s.n_components for s in series}
         if len(n_components) > 1:
@@ -1372,120 +1214,115 @@ def _log_backtest_metrics(
                 )
             )
 
-    # agg maps (key, step) -> per-series values, aggregated into the logged metric.
-    agg: dict[tuple[str, int], list[float]] = {}
-    rows: list[dict] = []
-
     # component names/count from the first series (all series share n_components)
-    comps = series[0].components.tolist()
-    n_scores, base_keys = _build_metric_keys(
+    metric_keys = _build_metric_keys(
         metric_names=metric_names,
-        components=comps,
+        components=series[0].components.tolist(),
         has_comp_axis=has_comp_axis,
         metric_axes=metric_axes,
         prefix="backtest_",
     )
+    series_metrics = [
+        _reshape_backtest_result(
+            series=series_,
+            result=r,
+            metric_keys=metric_keys,
+            has_time_axis=has_time_axis,
+            has_windows=has_windows,
+            forecast_horizon=forecast_horizon,
+        )
+        for series_, r in zip(series, results)
+    ]
+    stepped_metrics, detailed_metrics = _collect_stepped_and_detailed_metrics(
+        series_metrics=series_metrics,
+        metric_keys=metric_keys,
+        has_time_axis=has_time_axis,
+        has_windows=has_windows,
+    )
 
-    # first pass: reshape each series' result into a canonical (W, T, C, M)
-    # array, recording its window-axis length for the alignment pass below.
-    series_shapes = []
-    for r in results:
-        arr = np.asarray(r, dtype=float)
-        # after stripping C and M axes, rest = W*T (or W or T alone)
-        rest, extra = divmod(arr.size, n_scores * n_metrics)
-        if extra:
-            raise_log(
-                ValueError(
-                    f"Backtest metric logging failed: result size ({arr.size}) "
-                    f"is not divisible by n_scores * n_metrics ({n_scores} * "
-                    f"{n_metrics} = {n_scores * n_metrics}). The metric output "
-                    "shape does not match the inferred axes."
-                )
-            )
-
-        # both time and window axes present: backtest returns (W*T*C*M,) in C order so we can
-        # recover W and T only if forecast_horizon is known (T = forecast_horizon)
-        if has_time_axis and has_windows:
-            t_size, w_size = forecast_horizon, rest // forecast_horizon
-        elif has_time_axis:
-            t_size, w_size = rest, 1
-        elif has_windows:
-            t_size, w_size = 1, rest
-        else:
-            if rest != 1:
-                raise_log(
-                    ValueError(
-                        f"Backtest metric logging failed: expected a single "
-                        f"scalar per component/metric after reduction, but got "
-                        f"{rest} elements. Check time_reduction and "
-                        "component_reduction defaults."
-                    )
-                )
-            t_size, w_size = 1, 1
-
-        series_shapes.append((
-            t_size,
-            w_size,
-            arr.reshape(w_size, t_size, n_scores, n_metrics),
-        ))
-
-    # align the calendar-relative axes from the end
-    max_w_size = max((w_size for _, w_size, _ in series_shapes), default=0)
-    t_axis_is_calendar = has_time_axis and not has_windows and last_points_only
-
-    for series_index, (t_size, w_size, canonical) in enumerate(series_shapes):
-        w_offset = max_w_size - w_size if has_windows else 0
-        for m in range(n_metrics):
-            for c in range(n_scores):
-                key = base_keys[m][c]
-                if has_time_axis and has_windows:
-                    # Keep window-level values in the detailed table, but aggregate
-                    # windows into one chart value per horizon step for this series.
-                    for t in range(t_size):
-                        values = canonical[:, t, c, m]
-                        agg.setdefault((key, t), []).append(float(np.nanmean(values)))
-                        for w, value in enumerate(values):
-                            window_index = w + w_offset
-                            rows.append({
-                                "key": key,
-                                "series_index": series_index,
-                                "step": t,
-                                "window_index": window_index - max_w_size,
-                                "value": float(value),
-                            })
-                    continue
-
-                for w in range(w_size):
-                    aligned_w = w + w_offset
-                    for t in range(t_size):
-                        # MLflow step maps to the axis the UI should chart:
-                        # horizon when present, otherwise end-relative calendar axis
-                        if has_time_axis:
-                            step = t - t_size if t_axis_is_calendar else t
-                        else:
-                            step = aligned_w
-                        value = float(canonical[w, t, c, m])
-                        agg.setdefault((key, step), []).append(value)
-                        rows.append({
-                            "key": key,
-                            "series_index": series_index,
-                            "step": step,
-                            "window_index": None,
-                            "value": value,
-                        })
-
+    write_table = len(series) > 1 or (has_time_axis and has_windows)
     _flush_logged_metrics(
         autologging_client,
         run_id,
-        agg,
+        stepped_metrics,
         agg_func=agg_func,
-        table_rows=(
-            rows if len(series) > 1 or (has_time_axis and has_windows) else None
-        ),
+        table_rows=detailed_metrics if write_table else None,
     )
 
 
-def _infer_metric_axes(metric: Callable, metric_kwargs: dict) -> tuple:
+def _normalize_backtest_metrics(
+    backtest_args: dict,
+) -> tuple[list, list[dict], list[str]]:
+    """Normalize ``metric`` / ``metric_kwargs`` to parallel lists and key names.
+
+    ``backtest()`` accepts a single metric or a list, and a single kwargs
+    dict (broadcast to all metrics) or a list of dicts. A ``name`` entry in
+    ``metric_kwargs`` overrides the metric-name token in the MLflow key.
+    """
+    metrics = backtest_args.get("metric")
+    metrics = metrics if isinstance(metrics, list) else [metrics]
+    metric_kwargs = backtest_args.get("metric_kwargs") or {}
+    metric_kwargs = (
+        metric_kwargs if isinstance(metric_kwargs, list) else [metric_kwargs]
+    )
+    if len(metric_kwargs) != len(metrics):
+        metric_kwargs = [metric_kwargs[0]] * len(metrics)
+
+    metric_names = [
+        _sanitize_mlflow_key(
+            metric_kwargs[i].get("name") or getattr(m, "__name__", f"metric_{i}")
+        )
+        for i, m in enumerate(metrics)
+    ]
+    return metrics, metric_kwargs, metric_names
+
+
+def _resolve_backtest_layout(
+    backtest_args: dict,
+    metric: Callable,
+    metric_kwargs: dict,
+    is_single_series: bool,
+) -> tuple[bool, int | None]:
+    """Infer whether a window axis is present and the forecast horizon.
+
+    A window axis is present only when backtest did not aggregate windows
+    (``reduction is None``), forecasts were not concatenated first
+    (``last_points_only`` is false), and the metric's own
+    ``series_reduction`` did not already collapse windows.
+
+    When the caller passed ``historical_forecasts``, ``backtest()`` ignores
+    ``forecast_horizon``, so the horizon is read from the first forecast.
+
+    Returns
+    -------
+    tuple
+        ``(has_windows, forecast_horizon)``.
+    """
+    last_points_only = backtest_args.get("last_points_only", False)
+    has_windows = backtest_args.get("reduction") is None and not last_points_only
+
+    params = inspect.signature(metric).parameters
+    if has_windows and "series_reduction" in params:
+        series_reduction = metric_kwargs.get(
+            "series_reduction", params["series_reduction"].default
+        )
+        if series_reduction is not None:
+            has_windows = False
+
+    forecast_horizon = backtest_args.get("forecast_horizon")
+    historical_forecasts = backtest_args.get("historical_forecasts")
+    if historical_forecasts is not None and not last_points_only:
+        first_forecast = (
+            historical_forecasts[0] if is_single_series else historical_forecasts[0][0]
+        )
+        forecast_horizon = len(first_forecast)
+
+    return has_windows, forecast_horizon
+
+
+def _infer_metric_axes(
+    metric: Callable, metric_kwargs: dict
+) -> tuple[bool, bool, list[str]]:
     """Infer a metric's output axes from its signature and ``metric_kwargs``.
 
     Covers ``time_reduction``, ``component_reduction``, ``q``, ``q_interval``,
@@ -1533,7 +1370,7 @@ def _infer_metric_axes(metric: Callable, metric_kwargs: dict) -> tuple:
         axis_labels = [f"_qi{(hi - lo):.3f}" for lo, hi in intervals]
     elif "q" in params and q is not None:
         axis_labels = [f"_q{v:.3f}" for v in np.atleast_1d(np.array(q, dtype=float))]
-    elif "label_reduction" in params and getattr(metric, "__name__", ""):
+    elif "label_reduction" in params:
         label_reduction = effective("label_reduction")
         if isinstance(label_reduction, _LabelReduction):
             label_reduction = label_reduction.value
@@ -1556,7 +1393,268 @@ def _infer_metric_axes(metric: Callable, metric_kwargs: dict) -> tuple:
     else:
         axis_labels = [""]
 
-    return (has_time_axis, has_comp_axis, axis_labels)
+    return has_time_axis, has_comp_axis, axis_labels
+
+
+def _build_metric_keys(
+    metric_names: list[str],
+    components: list[str],
+    has_comp_axis: bool,
+    metric_axes: list[tuple[bool, bool, list[str]]],
+    *,
+    prefix: str = "",
+) -> list[list[str]]:
+    """Build sanitized MLflow metric keys for each metric x component x axis label.
+
+    Parameters
+    ----------
+    metric_names
+        One sanitized metric-name token per metric.
+    components
+        Component names from the first series (used only when ``has_comp_axis``).
+    has_comp_axis
+        Whether components are preserved in the metric output.
+    metric_axes
+        Per-metric ``(has_time_axis, has_comp_axis, axis_labels)`` tuples from
+        ``_infer_metric_axes``. Axis size is taken from the first entry.
+    prefix
+        Optional key prefix (e.g. ``"backtest_"``).
+
+    Returns
+    -------
+    list[list[str]]
+        A list of lists of metric keys, where each inner list contains the sub-metric
+        keys for a single metric. ``keys[m][i]`` is the sanitized key for metric index
+        ``m`` and sub-metric index ``i``. Sub-metric index ``i`` is the component-label
+        index walking axis labels innermost, then components (e.g. ``[_q0.100_comp1,
+        _q0.900_comp1, _q0.100_comp2, _q0.900_comp2]``).
+    """
+    component_names = components if has_comp_axis else [None]
+
+    metric_keys: list[list[str]] = []
+    for metric_idx, metric_name in enumerate(metric_names):
+        labels = metric_axes[metric_idx][2]
+        sub_metric_keys: list[str] = []
+        for component in component_names:
+            component_suffix = (
+                f"_{_sanitize_mlflow_key(component)}" if component is not None else ""
+            )
+            for label in labels:
+                sub_metric_keys.append(
+                    _sanitize_mlflow_key(
+                        f"{prefix}{metric_name}{component_suffix}{label}"
+                    )
+                )
+        metric_keys.append(sub_metric_keys)
+    return metric_keys
+
+
+def _reshape_backtest_result(
+    series: TimeSeries,
+    result,
+    *,
+    metric_keys: list[list[str]],
+    has_time_axis: bool,
+    has_windows: bool,
+    forecast_horizon: int | None,
+) -> np.ndarray:
+    """Reshape one series' backtest result to canonical ``(W, T, C, M)``.
+
+    - ``C`` is ``n_sub_metrics`` (n_components * n_quantiles/n_labels)
+    - ``M`` is ``n_metrics``
+    - ``T`` is ``1`` if not present, and otherwise the ``forecast_horizon`` or
+      the length of the series (with ``last_points_only=True``).
+    - ``W`` is ``1`` if not present, and otherwise the number of windows
+
+    After stripping the ``C`` and ``M`` axes, the leftover element count is split into
+    ``(t_size, w_size)``:
+
+    - time axis and windows: ``T = forecast_horizon``, ``W = rest / T``
+    - time axis only: ``T = rest``, ``W = 1``
+    - windows only: ``T = 1``, ``W = rest``
+    - neither: ``T = W = 1`` (``rest`` must be 1)
+
+    Returns
+    -------
+    np.ndarray
+        Series metric values with shape ``(W, T, C, M)``.
+    """
+    arr = np.asarray(result, dtype=series.dtype)
+    n_metrics = len(metric_keys)
+    n_sub_metrics = len(metric_keys[0])
+    n_round_multiples, remainder = divmod(arr.size, n_sub_metrics * n_metrics)
+    if remainder:
+        raise_log(
+            ValueError(
+                f"Backtest metric logging failed: result size ({arr.size}) "
+                f"is not divisible by n_sub_metrics * n_metrics ({n_sub_metrics} * "
+                f"{n_metrics} = {n_sub_metrics * n_metrics}). The metric output "
+                "shape does not match the inferred axes."
+            )
+        )
+
+    if has_time_axis and has_windows:
+        # T is the forecast horizon; W is recovered from the leftover length;
+        # time-dependent metrics + last_points_only=False + no reduction
+        assert forecast_horizon is not None
+        t_size, w_size = forecast_horizon, n_round_multiples // forecast_horizon
+    elif has_time_axis:
+        # time-dependent metrics + last_points_only=False + reduction
+        t_size, w_size = n_round_multiples, 1
+    elif has_windows:
+        # time-aggregated metrics + last_points_only=False + no reduction
+        t_size, w_size = 1, n_round_multiples
+    elif n_round_multiples == 1:
+        # time-aggregated metrics + reduction
+        t_size, w_size = 1, 1
+    else:
+        raise_log(
+            ValueError(
+                f"Backtest metric logging failed: expected a single "
+                f"scalar per component/metric after reduction, but got "
+                f"{n_round_multiples} elements. Check time_reduction and "
+                "component_reduction defaults."
+            )
+        )
+
+    return arr.reshape(w_size, t_size, n_sub_metrics, n_metrics)
+
+
+def _collect_stepped_and_detailed_metrics(
+    series_metrics: list[np.ndarray],
+    metric_keys: list[list[str]],
+    *,
+    has_time_axis: bool,
+    has_windows: bool,
+) -> tuple[dict[tuple[str, int], list[float]], list[dict]]:
+    """Parse series metrics and build inputs for MLflow stepped metrics and detailed metric table.
+
+    Each ``series_metrics`` array has shape ``(w_size, t_size, n_metrics * n_sub_metrics)``.
+    Shorter series are aligned from the end of the longest remaining axis (windows,
+    or time when there is no window axis).
+
+    The MLflow ``step`` is the axis the UI should chart, always ``0 .. n-1``:
+
+    - forecast-horizon index when a time axis is present (time-dependent metrics)
+      - if windows are present: each horizon step is aggregated over the windows
+      - if multi-series: each horizon step is aggregated over the series
+    - end-aligned window index otherwise (time-aggregated metrics)
+      - if multi-series: each window is aggregated over the series (end-aligned)
+    """
+    stepped_metrics: dict[tuple[str, int], list[float]] = {}
+    detailed_metrics: list[dict] = []
+
+    w_axis, t_axis = 0, 1
+    max_w_size = max((values.shape[w_axis] for values in series_metrics), default=0)
+    max_t_size = max((values.shape[t_axis] for values in series_metrics), default=0)
+
+    for series_index, values in enumerate(series_metrics):
+        w_size = values.shape[w_axis]
+        t_size = values.shape[t_axis]
+        # pad shorter series so their last point lines up with the longest
+        w_offset = max_w_size - w_size if has_windows else 0
+        t_offset = max_t_size - t_size if has_time_axis and not has_windows else 0
+
+        window_agg = np.nanmean(values, axis=w_axis)
+        for metric_idx, sub_metric_keys in enumerate(metric_keys):
+            for sub_metric_idx, key in enumerate(sub_metric_keys):
+                for w in range(w_size):
+                    window_index = w + w_offset if has_windows else None
+                    for t in range(t_size):
+                        value = float(values[w, t, sub_metric_idx, metric_idx])
+                        if has_time_axis and has_windows:
+                            # time-dependent metrics + last_points_only=False + no reduction
+                            step = t
+
+                            # stepped metric chart: one value per horizon (windows averaged)
+                            if w == 0:
+                                stepped_metrics.setdefault((key, step), []).append(
+                                    float(window_agg[t, sub_metric_idx, metric_idx])
+                                )
+                        else:
+                            if has_time_axis:
+                                # time-dependent metrics + last_points_only=False + reduction
+                                step = t + t_offset
+                            else:
+                                step = window_index
+
+                            # stepped metric chart: one value per window or horizon
+                            stepped_metrics.setdefault((key, step), []).append(value)
+
+                        # table: one value per window and horizon
+                        detailed_metrics.append({
+                            "key": key,
+                            "series_index": series_index,
+                            "step": step,
+                            "window_index": window_index,
+                            "value": value,
+                        })
+
+    return stepped_metrics, detailed_metrics
+
+
+def _flush_logged_metrics(
+    autologging_client: MlflowAutologgingQueueingClient,
+    run_id: str,
+    agg: dict[tuple[str, int], list[float]],
+    agg_func: Callable,
+    table_rows: list[dict] | None = None,
+) -> None:
+    """Aggregate per-series cells, log MLflow metrics, and optionally write the
+    per-series table artifact.
+
+    Parameters
+    ----------
+    autologging_client
+        MLflow autologging client used to queue metric writes.
+    run_id
+        ID of the active MLflow run.
+    agg
+        Map of ``(key, step) -> list of per-series float values``.
+    agg_func
+        Aggregation over the per-series values for each ``(key, step)``.
+    table_rows
+        Granular cells for ``metrics_per_series.json``. ``None`` skips writing
+        the table artifact.
+    """
+    metrics_by_step: dict[int, dict[str, float]] = {}
+    for (key, step), values in agg.items():
+        metrics_by_step.setdefault(step, {})[key] = float(agg_func(values))
+    for step, metrics in metrics_by_step.items():
+        autologging_client.log_metrics(run_id=run_id, metrics=metrics, step=step)
+
+    if table_rows is not None:
+        _log_per_series_table(table_rows)
+
+
+def _log_per_series_table(rows: list[dict]) -> None:
+    """Append the granular per-series metric breakdown to a single, run-wide
+    table artifact.
+
+    Each row is a single metric cell for one series, with columns ``key`` (the
+    aggregate MLflow key, without any series suffix), ``series_index``, ``step``
+    (the time or window index charted by MLflow), ``window_index`` (the
+    end-aligned source backtest window ``0 .. max_w - 1``, or ``None`` when
+    there is no window axis), and ``value``. All calls within a run append
+    to the same ``metrics_per_series.json`` artifact.
+    Used when more than one series is scored, since the logged metric keys
+    only carry the aggregate over series.
+
+    Parameters
+    ----------
+    rows
+        One dict per metric cell with keys ``key``, ``series_index``, ``step``,
+        ``window_index``, and ``value``.
+    """
+    if not rows:
+        return
+
+    df = pd.DataFrame(rows)
+    sort_by = ["key", "series_index", "step"]
+    if "window_index" in df.columns:
+        sort_by.append("window_index")
+    df = df.sort_values(sort_by)
+    mlflow.log_table(data=df, artifact_file="metrics_per_series.json")
 
 
 def _log_metric_result(
@@ -1659,27 +1757,28 @@ def _log_metric_result(
 
     # component names/count from the first series (all series share n_components)
     comps = series_seq[0].components.tolist()
-    n_scores, base_keys = _build_metric_keys(
+    metric_keys = _build_metric_keys(
         [metric_name],
         comps,
         has_comp_axis,
         [(has_time_axis, has_comp_axis, axis_labels)],
     )
-    keys = base_keys[0]
+    sub_metric_keys = metric_keys[0]
+    n_sub_metrics = len(sub_metric_keys)
 
     # first pass: reshape each series' result into a canonical (T, C) array,
     # recording its time-axis length for the alignment pass below.
-    series_shapes = []
+    series_metrics = []
     for r in results:
         arr = np.asarray(r, dtype=float)
         # after stripping the C axis, the remainder is the time axis (or scalar)
-        n_times, extra = divmod(arr.size, n_scores)
+        n_times, extra = divmod(arr.size, n_sub_metrics)
         if extra:
             raise_log(
                 ValueError(
                     f"Metric logging failed for `{metric_name}`: result size "
                     f"({arr.size}) is not divisible by the inferred "
-                    f"component/quantile size ({n_scores}). The metric output "
+                    f"component/quantile size ({n_sub_metrics}). The metric output "
                     "shape does not match the inferred axes."
                 )
             )
@@ -1698,13 +1797,13 @@ def _log_metric_result(
         else:
             t_size = 1
 
-        series_shapes.append((t_size, arr.reshape(t_size, n_scores)))
+        series_metrics.append((t_size, arr.reshape(t_size, n_sub_metrics)))
 
     # agg maps (key, step) -> per-series values, aggregated into the logged metric.
     agg: dict[tuple[str, int], list[float]] = {}
     rows: list[dict] = []
-    for series_index, (t_size, canonical) in enumerate(series_shapes):
-        for c, key in enumerate(keys):
+    for series_index, (t_size, canonical) in enumerate(series_metrics):
+        for c, key in enumerate(sub_metric_keys):
             for t in range(t_size):
                 # Forecast positions are zero-based: the first prediction is 0.
                 step = t if has_time_axis else 0
