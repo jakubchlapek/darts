@@ -1095,17 +1095,17 @@ class TestMLflow:
         history = mlflow_tracking.get_metric_history(run.info.run_id, "ae")
         by_step = {m.step: m.value for m in history}
         assert len(by_step) == 50
-        for step in range(40):
-            assert by_step[step] == pytest.approx(1.5, abs=1e-4), step
-        for step in range(40, 50):
+        for step in range(10):
             assert by_step[step] == pytest.approx(1.0, abs=1e-4), step
+        for step in range(10, 50):
+            assert by_step[step] == pytest.approx(1.5, abs=1e-4), step
 
         rows = self._read_per_series_table(run.info.run_id)
         steps_by_series = {0: set(), 1: set()}
         for r in rows:
             steps_by_series[r["series_index"]].add(r["step"])
         assert steps_by_series[0] == set(range(50))
-        assert steps_by_series[1] == set(range(40))
+        assert steps_by_series[1] == set(range(10, 50))
 
     def test_autolog_metric_quantile(self, mlflow_tracking, autolog_context):
         """A quantile metric (mql) logs one key per quantile with matching values."""
