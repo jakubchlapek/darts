@@ -88,6 +88,18 @@ def assert_mlflow_artifacts_exist(path: str, is_torch: bool = False):
         assert os.path.exists(os.path.join(path, "model.pkl"))
 
 
+BT_REQUIRED_DEFAUTLS = {
+    "historical_forecasts": None,
+    "forecast_horizon": 1,
+    "last_points_only": False,
+    "past_covariates": None,
+    "future_covariates": None,
+    "reduction": np.nanmean,
+    "metric": dm.mape,
+    "metric_kwargs": None,
+}
+
+
 def assert_predictions_equal(
     model1: ForecastingModel,
     model2: ForecastingModel,
@@ -1095,17 +1107,17 @@ class TestMLflow:
         history = mlflow_tracking.get_metric_history(run.info.run_id, "ae")
         by_step = {m.step: m.value for m in history}
         assert len(by_step) == 50
-        for step in range(10):
-            assert by_step[step] == pytest.approx(1.0, abs=1e-4), step
-        for step in range(10, 50):
+        for step in range(40):
             assert by_step[step] == pytest.approx(1.5, abs=1e-4), step
+        for step in range(40, 50):
+            assert by_step[step] == pytest.approx(1.0, abs=1e-4), step
 
         rows = self._read_per_series_table(run.info.run_id)
         steps_by_series = {0: set(), 1: set()}
         for r in rows:
             steps_by_series[r["series_index"]].add(r["step"])
         assert steps_by_series[0] == set(range(50))
-        assert steps_by_series[1] == set(range(10, 50))
+        assert steps_by_series[1] == set(range(40))
 
     def test_autolog_metric_quantile(self, mlflow_tracking, autolog_context):
         """A quantile metric (mql) logs one key per quantile with matching values."""
@@ -1503,7 +1515,11 @@ class TestMLflow:
         with mlflow.start_run() as run:
             client = MlflowAutologgingQueueingClient()
             _log_backtest_metrics(
-                client, run.info.run_id, result, backtest_args, agg_func=np.median
+                client,
+                run.info.run_id,
+                result,
+                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
+                agg_func=np.median,
             )
             client.flush(synchronous=True)
 
@@ -1683,7 +1699,12 @@ class TestMLflow:
 
         with mlflow.start_run() as run:
             client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(client, run.info.run_id, result, backtest_args)
+            _log_backtest_metrics(
+                client,
+                run.info.run_id,
+                result,
+                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
+            )
             client.flush(synchronous=True)
 
         m = mlflow.get_run(run.info.run_id).data.metrics
@@ -1711,7 +1732,12 @@ class TestMLflow:
         with mlflow.start_run() as run:
             client = MlflowAutologgingQueueingClient()
             with pytest.raises(ValueError, match="same number of components"):
-                _log_backtest_metrics(client, run.info.run_id, result, backtest_args)
+                _log_backtest_metrics(
+                    client,
+                    run.info.run_id,
+                    result,
+                    {**BT_REQUIRED_DEFAUTLS, **backtest_args},
+                )
 
         assert not mlflow.get_run(run.info.run_id).data.metrics
 
@@ -1736,7 +1762,10 @@ class TestMLflow:
             client = MlflowAutologgingQueueingClient()
             with pytest.raises(ValueError, match="requires explicit `labels`"):
                 _log_backtest_metrics(
-                    client, run.info.run_id, np.array([0.5]), backtest_args
+                    client,
+                    run.info.run_id,
+                    np.array([0.5]),
+                    {**BT_REQUIRED_DEFAUTLS, **backtest_args},
                 )
 
     def test_log_backtest_metrics_label_count_mismatch(self, mlflow_tracking):
@@ -1766,7 +1795,10 @@ class TestMLflow:
             client = MlflowAutologgingQueueingClient()
             with pytest.raises(ValueError, match="not divisible"):
                 _log_backtest_metrics(
-                    client, run.info.run_id, fake_result, backtest_args
+                    client,
+                    run.info.run_id,
+                    fake_result,
+                    {**BT_REQUIRED_DEFAUTLS, **backtest_args},
                 )
 
         assert not mlflow.get_run(run.info.run_id).data.metrics
@@ -1790,7 +1822,12 @@ class TestMLflow:
 
         with mlflow.start_run() as run:
             client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(client, run.info.run_id, result, backtest_args)
+            _log_backtest_metrics(
+                client,
+                run.info.run_id,
+                result,
+                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
+            )
             client.flush(synchronous=True)
 
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
@@ -1828,7 +1865,12 @@ class TestMLflow:
 
         with mlflow.start_run() as run:
             client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(client, run.info.run_id, result, backtest_args)
+            _log_backtest_metrics(
+                client,
+                run.info.run_id,
+                result,
+                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
+            )
             client.flush(synchronous=True)
 
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
