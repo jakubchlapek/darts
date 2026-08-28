@@ -1,3 +1,4 @@
+import copy
 import logging
 import os
 
@@ -13,7 +14,12 @@ from darts.models.forecasting.forecasting_model import (
     ForecastingModel,
     GlobalForecastingModel,
 )
-from darts.tests.conftest import MLFLOW_AVAILABLE, TORCH_AVAILABLE, tfm_kwargs_dev
+from darts.tests.conftest import (
+    MLFLOW_AVAILABLE,
+    TORCH_AVAILABLE,
+    tfm_kwargs,
+    tfm_kwargs_dev,
+)
 
 if not MLFLOW_AVAILABLE:
     pytest.skip(
@@ -43,6 +49,22 @@ from darts.utils.mlflow import (
 
 if TORCH_AVAILABLE:
     from darts.models import NBEATSModel
+
+
+TS_UNIVARIATE = tg.sine_timeseries(length=50).astype("float32")
+TS_MULTIVARIATE = TS_UNIVARIATE.stack(TS_UNIVARIATE * 1.5)
+TS_WITH_STATIC = TS_UNIVARIATE.with_static_covariates(
+    pd.DataFrame({"static_feat": [1.0]})
+)
+TS_PAST_COV = tg.sine_timeseries(length=62).astype("float32")
+TS_FUTURE_COV = tg.constant_timeseries(value=1.0, length=62).astype("float32")
+# binary classification series with values {0.0, 1.0}
+TS_BINARY = tg.constant_timeseries(value=0.0, length=50).with_values(
+    np.random.default_rng(42)
+    .choice([0.0, 1.0], size=50)
+    .astype(np.float32)
+    .reshape(-1, 1)
+)
 
 
 @pytest.fixture
@@ -136,28 +158,33 @@ def assert_predictions_equal(
     )
 
 
-class TestMLflow:
-    ts_univariate = tg.linear_timeseries(
-        start_value=10, end_value=50, length=50
-    ).astype("float32")
-    ts_multivariate = ts_univariate.stack(ts_univariate * 1.5)
-    ts_with_static = ts_univariate.with_static_covariates(
-        pd.DataFrame({"static_feat": [1.0]})
-    )
-    ts_past_cov = tg.sine_timeseries(length=62).astype("float32")
-    ts_future_cov = tg.constant_timeseries(value=1.0, length=62).astype("float32")
-    # binary classification series with values {0.0, 1.0}
-    ts_binary = tg.constant_timeseries(value=0.0, length=50).with_values(
-        np.random.default_rng(42)
-        .choice([0.0, 1.0], size=50)
-        .astype(np.float32)
-        .reshape(-1, 1)
-    )
+def _read_per_series_table(run_id):
+    """Load the run's consolidated per-series metric table into row dicts."""
+    df = mlflow.load_table(artifact_file="metrics_per_series.json", run_ids=[run_id])
+    return df.to_dict("records")
 
+
+def _fit_lr(series=None):
+    """Fit and return a fresh LinearRegressionModel (no active run)."""
+    model = LinearRegressionModel(lags=1)
+    model.fit(series if series is not None else TS_UNIVARIATE)
+    return model
+
+
+def _fit_qlr(series=None):
+    """Fit and return a fresh quantile LinearRegressionModel (no active run)."""
+    model = LinearRegressionModel(
+        lags=1, likelihood="quantile", quantiles=[0.1, 0.5, 0.9]
+    )
+    model.fit(series if series is not None else TS_UNIVARIATE)
+    return model
+
+
+class TestMLflow:
     def test_save_load_statistical_model(self, tmpdir_fn):
         """Test save/load round-trip for statistical model"""
         model = ExponentialSmoothing()
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         model_path = os.path.join(tmpdir_fn, "test_model")
         save_model(model, model_path)
@@ -170,7 +197,7 @@ class TestMLflow:
     def test_save_load_regression_model(self, tmpdir_fn):
         """Test save/load round-trip for regression model"""
         model = LinearRegressionModel(lags=5)
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         model_path = os.path.join(tmpdir_fn, "test_model")
         save_model(model, model_path)
@@ -178,7 +205,7 @@ class TestMLflow:
         assert_mlflow_artifacts_exist(model_path, is_torch=False)
 
         loaded_model = load_model(f"file://{model_path}")
-        assert_predictions_equal(model, loaded_model, n=3, series=self.ts_univariate)
+        assert_predictions_equal(model, loaded_model, n=3, series=TS_UNIVARIATE)
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
     def test_save_load_torch_model(self, tmpdir_fn):
@@ -186,7 +213,7 @@ class TestMLflow:
         model = NBEATSModel(
             input_chunk_length=4, output_chunk_length=2, n_epochs=1, **tfm_kwargs_dev
         )
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         model_path = os.path.join(tmpdir_fn, "test_model")
         save_model(model, model_path)
@@ -199,12 +226,12 @@ class TestMLflow:
             f"file://{model_path}",
             pl_trainer_kwargs=tfm_kwargs_dev.get("pl_trainer_kwargs", {}),
         )
-        assert_predictions_equal(model, loaded_model, n=2, series=self.ts_univariate)
+        assert_predictions_equal(model, loaded_model, n=2, series=TS_UNIVARIATE)
 
     def test_log_model_basic(self, mlflow_tracking):
         """Test basic log_model functionality"""
         model = ExponentialSmoothing()
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         with mlflow.start_run():
             log_info = log_model(model, name="model")
@@ -215,7 +242,7 @@ class TestMLflow:
     def test_log_model_with_covariates(self, mlflow_tracking):
         """Test that covariate info is logged with correct values"""
         model = LinearRegressionModel(lags=5, lags_past_covariates=3)
-        model.fit(self.ts_univariate[:40], past_covariates=self.ts_past_cov[:40])
+        model.fit(TS_UNIVARIATE[:40], past_covariates=TS_PAST_COV[:40])
 
         with mlflow.start_run():
             log_model(model, name="model")
@@ -226,8 +253,8 @@ class TestMLflow:
             model,
             loaded_model,
             n=5,
-            series=self.ts_univariate[:40],
-            past_covariates=self.ts_past_cov,
+            series=TS_UNIVARIATE[:40],
+            past_covariates=TS_PAST_COV,
         )
 
     def test_log_model_with_all_covariate_types(self, mlflow_tracking):
@@ -237,9 +264,9 @@ class TestMLflow:
             lags=5, lags_past_covariates=3, lags_future_covariates=[0, 1]
         )
         model.fit(
-            self.ts_with_static[:40],
-            past_covariates=self.ts_past_cov[:40],
-            future_covariates=self.ts_future_cov[:50],
+            TS_WITH_STATIC[:40],
+            past_covariates=TS_PAST_COV[:40],
+            future_covariates=TS_FUTURE_COV[:50],
         )
 
         with mlflow.start_run():
@@ -251,41 +278,37 @@ class TestMLflow:
             model,
             loaded_model,
             n=5,
-            series=self.ts_with_static[:40],
-            past_covariates=self.ts_past_cov,
-            future_covariates=self.ts_future_cov,
+            series=TS_WITH_STATIC[:40],
+            past_covariates=TS_PAST_COV,
+            future_covariates=TS_FUTURE_COV,
         )
 
     def test_autolog_enable_disable(self, mlflow_tracking, autolog_context):
         """Test autolog can be enabled and disabled"""
-        with autolog_context():
-            with mlflow.start_run():
-                model = ExponentialSmoothing()
-                model.fit(self.ts_univariate)
+        client = mlflow_tracking
+        runs = mlflow.search_runs()
+        assert len(runs) == 0
 
+        autolog()
+        with mlflow.start_run():
             runs = mlflow.search_runs()
-            assert len(runs) == 1, "Expected exactly one run after autolog fit"
+            assert len(runs) == 1
+            run_id = runs.iloc[0]["run_id"]
 
-            # verify the run has expected content
-            last_run = runs.iloc[0]
-            assert last_run["tags.model_class"] == "ExponentialSmoothing"
-            assert last_run["tags.mlflow.runName"] is not None
+            # metric is auto-logged
+            dm.mae(TS_UNIVARIATE, TS_UNIVARIATE, name="auto_logged")
+            assert len(client.get_metric_history(run_id, "auto_logged")) == 1
 
-        # after context exits, autolog should be disabled
-        model2 = ExponentialSmoothing()
-        model2.fit(self.ts_univariate)
-
-        runs_after_disable = mlflow.search_runs()
-        assert len(runs_after_disable) == 1, (
-            "No new run should be created after disable"
-        )
+            autolog(disable=True)
+            dm.mae(TS_UNIVARIATE, TS_UNIVARIATE, name="not_logged")
+            assert len(client.get_metric_history(run_id, "not_logged")) == 0
 
     def test_autolog_parameters(self, mlflow_tracking, autolog_context):
         """Test that autolog logs model parameters"""
         with autolog_context():
             with mlflow.start_run():
                 model = ExponentialSmoothing(seasonal_periods=12)
-                model.fit(self.ts_univariate)
+                model.fit(TS_UNIVARIATE)
 
             runs = mlflow.search_runs()
             assert len(runs) == 1
@@ -301,7 +324,7 @@ class TestMLflow:
         with autolog_context():
             with mlflow.start_run() as run:
                 model = ExponentialSmoothing(seasonal_periods=12)
-                model.fit(self.ts_univariate)
+                model.fit(TS_UNIVARIATE)
 
         params = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/model_params.json"
@@ -309,120 +332,19 @@ class TestMLflow:
         assert params["seasonal_periods"] == 12
         assert params["trend"] == str(model.model_params["trend"])
 
-    @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
-    def test_autolog_torch_metrics(self, mlflow_tracking, autolog_context):
-        """Test that autolog logs training metrics for torch models"""
-        with autolog_context():
-            with mlflow.start_run():
-                model = NBEATSModel(
-                    input_chunk_length=4,
-                    output_chunk_length=2,
-                    n_epochs=2,
-                    **tfm_kwargs_dev,
-                )
-                train, val = self.ts_univariate.split_before(0.7)
-                model.fit(train, val_series=val)
-
-            runs = mlflow.search_runs()
-            assert len(runs) == 1, "Expected exactly one run"
-            last_run = runs.iloc[0]
-            last_run_id = last_run["run_id"]
-            assert last_run["tags.model_class"] == "NBEATSModel"
-
-            client = mlflow.tracking.MlflowClient()
-
-            # check train_loss metrics
-            train_metrics = client.get_metric_history(last_run_id, "train_loss")
-            assert len(train_metrics) > 0, "Expected train_loss metrics to be logged"
-            assert len(train_metrics) <= 2, "Expected at most 2 epochs of train_loss"
-
-            for m in train_metrics:
-                assert np.isfinite(m.value), f"train_loss is not finite: {m.value}"
-                assert m.value >= 0, f"train_loss is negative: {m.value}"
-                assert m.step >= 0, "Metric step should be non-negative"
-
-            val_metrics = client.get_metric_history(last_run_id, "val_loss")
-            if val_metrics:
-                for m in val_metrics:
-                    assert np.isfinite(m.value), f"val_loss is not finite: {m.value}"
-                    assert m.value >= 0, f"val_loss is negative: {m.value}"
-
-    @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
-    def test_autolog_pytorch_autolog_enabled(self, mlflow_tracking, autolog_context):
-        """Test that autolog enables mlflow.pytorch.autolog and logs per-epoch
-        train_loss, val_loss, and custom torch_metrics with finite non-negative values."""
-        import torchmetrics
-        from mlflow.utils.autologging_utils import autologging_is_disabled
-
-        n_epochs = 2
-
-        def assert_metric(history, key):
-            assert len(history) > 0, f"{key} not logged"
-            assert len(history) <= n_epochs, f"too many {key} entries"
-            assert all(np.isfinite(m.value) and m.value >= 0 for m in history)
-
-        with autolog_context():
-            assert not autologging_is_disabled("pytorch")
-
-            with mlflow.start_run():
-                model = NBEATSModel(
-                    input_chunk_length=4,
-                    output_chunk_length=2,
-                    n_epochs=n_epochs,
-                    torch_metrics=torchmetrics.MeanAbsoluteError(),
-                    **tfm_kwargs_dev,
-                )
-                train, val = self.ts_univariate.split_before(0.7)
-                model.fit(train, val_series=val)
-
-            runs = mlflow.search_runs()
-            assert len(runs) == 1
-            run_id = runs.iloc[0]["run_id"]
-            assert runs.iloc[0]["tags.model_class"] == "NBEATSModel"
-
-            client = mlflow.tracking.MlflowClient()
-            assert_metric(client.get_metric_history(run_id, "train_loss"), "train_loss")
-            assert_metric(client.get_metric_history(run_id, "val_loss"), "val_loss")
-            # custom torch_metrics: in normal use both train_/val_ prefixes are logged, but
-            # fast_dev_run suppresses the Lightning logger during traininge
-            assert_metric(
-                client.get_metric_history(run_id, "val_MeanAbsoluteError"),
-                "val_MeanAbsoluteError",
-            )
-
-        assert autologging_is_disabled("pytorch")
-
-    def test_autolog_series_info_single_series(self, mlflow_tracking, autolog_context):
+    @pytest.mark.parametrize("single_series", [True, False])
+    def test_autolog_series_info_single_series(
+        self, mlflow_tracking, autolog_context, single_series
+    ):
         """The series_info.json artifact reports the target series' component
         names/count, plus covariate usage, count, and names, for a
         single-series fit."""
-        with autolog_context():
-            with mlflow.start_run() as run:
-                model = LinearRegressionModel(lags=5, lags_past_covariates=3)
-                model.fit(
-                    self.ts_univariate[:40], past_covariates=self.ts_past_cov[:40]
-                )
+        series = TS_UNIVARIATE[:40]
+        past_covs = TS_PAST_COV[:40]
+        if not single_series:
+            series = [series] * 2
+            past_covs = [past_covs] * 2
 
-        series_info = mlflow.artifacts.load_dict(
-            f"runs:/{run.info.run_id}/series_info.json"
-        )
-        assert series_info["series"]["count"] == self.ts_univariate.n_components
-        assert series_info["series"]["names"] == self.ts_univariate.components.tolist()
-        assert series_info["past_covariates"]["used"] is True
-        assert series_info["past_covariates"]["count"] == 1
-        assert (
-            series_info["past_covariates"]["names"]
-            == self.ts_past_cov.components.tolist()
-        )
-        assert series_info["future_covariates"]["used"] is False
-        assert series_info["static_covariates"]["used"] is False
-
-    def test_autolog_series_info_multi_series(self, mlflow_tracking, autolog_context):
-        """Fitting on a list of series doesn't leave past_covariates unreported:
-        `model.past_covariate_series` stays None for a multi-series fit, so the
-        info must come from the actual `fit()` call arguments instead."""
-        series = [self.ts_univariate, self.ts_univariate * 1.2]
-        past_covs = [self.ts_past_cov[:50], self.ts_past_cov[:50]]
         with autolog_context():
             with mlflow.start_run() as run:
                 model = LinearRegressionModel(lags=5, lags_past_covariates=3)
@@ -431,12 +353,15 @@ class TestMLflow:
         series_info = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/series_info.json"
         )
+        assert series_info["series"]["count"] == TS_UNIVARIATE.n_components
+        assert series_info["series"]["names"] == TS_UNIVARIATE.components.tolist()
         assert series_info["past_covariates"]["used"] is True
         assert series_info["past_covariates"]["count"] == 1
         assert (
-            series_info["past_covariates"]["names"]
-            == self.ts_past_cov.components.tolist()
+            series_info["past_covariates"]["names"] == TS_PAST_COV.components.tolist()
         )
+        assert series_info["future_covariates"]["used"] is False
+        assert series_info["static_covariates"]["used"] is False
 
     def test_autolog_series_info_add_encoders(self, mlflow_tracking, autolog_context):
         """Covariates generated purely via `add_encoders` (no explicit
@@ -449,7 +374,7 @@ class TestMLflow:
                     lags_future_covariates=[0],
                     add_encoders={"datetime_attribute": {"future": ["month"]}},
                 )
-                model.fit(self.ts_univariate[:40])
+                model.fit(TS_UNIVARIATE[:40])
 
         series_info = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/series_info.json"
@@ -461,13 +386,11 @@ class TestMLflow:
         assert series_info["future_covariates"]["encodings"] == expected_names
         assert series_info["past_covariates"]["used"] is False
 
-    def test_autolog_series_info_static_is_global(
+    def test_autolog_series_info_static_covariates(
         self, mlflow_tracking, autolog_context
     ):
-        """`is_global` is based on row count vs. the number of series
-        components, not the number of static-covariate columns."""
         # one shared row over 2 components -> global
-        global_target = self.ts_multivariate.with_static_covariates(
+        global_target = TS_MULTIVARIATE.with_static_covariates(
             pd.DataFrame({"a": [1.0], "b": [2.0]})
         )
         with autolog_context():
@@ -480,7 +403,7 @@ class TestMLflow:
         assert series_info["static_covariates"]["names"] == ["a", "b"]
 
         # one row per component (2 components, 2 rows) -> component-specific
-        per_component_target = self.ts_multivariate.with_static_covariates(
+        per_component_target = TS_MULTIVARIATE.with_static_covariates(
             pd.DataFrame({"a": [1.0, 2.0]})
         )
         with autolog_context():
@@ -492,80 +415,29 @@ class TestMLflow:
         assert series_info["static_covariates"]["count"] == 1
         assert series_info["static_covariates"]["names"] == ["a"]
 
+    @pytest.mark.parametrize("method", ["historical_forecasts", "backtest"])
     def test_autolog_historical_forecasts_series_info_covariates(
-        self, mlflow_tracking, autolog_context
+        self, mlflow_tracking, autolog_context, method
     ):
-        """HF without a prior fit() still reports explicit covariates and static
-        covariates in series_info / tags (outer model stays unfitted)."""
-        target = self.ts_univariate.with_static_covariates(
+        """HF and backtest without a prior fit() still reports model params and series_info
+        (but not the model artifact)."""
+        target = TS_UNIVARIATE.with_static_covariates(
             pd.DataFrame({"static_feat": [1.0]})
         )
-        with autolog_context():
-            with mlflow.start_run() as run:
-                model = LinearRegressionModel(lags=5, lags_past_covariates=3)
-                model.historical_forecasts(
-                    series=target,
-                    past_covariates=self.ts_past_cov,
-                    forecast_horizon=1,
-                    retrain=True,
-                    start=0.5,
-                )
-
-        series_info = mlflow.artifacts.load_dict(
-            f"runs:/{run.info.run_id}/series_info.json"
-        )
-        assert series_info["past_covariates"]["used"] is True
-        assert (
-            series_info["past_covariates"]["names"]
-            == self.ts_past_cov.components.tolist()
-        )
-        assert series_info["static_covariates"]["used"] is True
-        assert series_info["static_covariates"]["names"] == ["static_feat"]
-        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
-        assert tags["model_uses_past_covariates"] == "True"
-        assert tags["model_uses_static_covariates"] == "True"
-
-    def test_autolog_historical_forecasts_series_info_add_encoders(
-        self, mlflow_tracking, autolog_context
-    ):
-        """HF with add_encoders (no explicit cov args) marks future covariates
-        as used even though the outer model remains unfitted."""
-        with autolog_context():
+        with autolog_context(log_models=True):
             with mlflow.start_run() as run:
                 model = LinearRegressionModel(
                     lags=5,
+                    lags_past_covariates=3,
                     lags_future_covariates=[0],
                     add_encoders={"datetime_attribute": {"future": ["month"]}},
                 )
-                model.historical_forecasts(
-                    series=self.ts_univariate,
+                _ = getattr(model, method)(
+                    series=target,
+                    past_covariates=TS_PAST_COV,
                     forecast_horizon=1,
                     retrain=True,
-                    start=0.5,
-                )
-
-        series_info = mlflow.artifacts.load_dict(
-            f"runs:/{run.info.run_id}/series_info.json"
-        )
-        assert series_info["future_covariates"]["used"] is True
-        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
-        assert tags["model_uses_future_covariates"] == "True"
-
-    def test_autolog_backtest_series_info_covariates(
-        self, mlflow_tracking, autolog_context
-    ):
-        """backtest(retrain=True) without a prior fit() reports covariates via
-        the internal historical_forecasts path."""
-        with autolog_context():
-            with mlflow.start_run() as run:
-                model = LinearRegressionModel(lags=5, lags_past_covariates=3)
-                model.backtest(
-                    series=self.ts_univariate,
-                    past_covariates=self.ts_past_cov,
-                    forecast_horizon=1,
-                    retrain=True,
-                    start=0.5,
-                    metric=dm.mae,
+                    start=-1,
                 )
 
         series_info = mlflow.artifacts.load_dict(
@@ -573,47 +445,37 @@ class TestMLflow:
         )
         assert series_info["past_covariates"]["used"] is True
         assert (
-            series_info["past_covariates"]["names"]
-            == self.ts_past_cov.components.tolist()
+            series_info["past_covariates"]["names"] == TS_PAST_COV.components.tolist()
         )
-
-    def test_autolog_historical_forecasts_logs_model_setup(
-        self, mlflow_tracking, autolog_context
-    ):
-        """historical_forecasts(retrain=True) without a prior fit() still logs
-        model params and series_info (but not the model artifact)."""
-        with autolog_context():
-            with mlflow.start_run() as run:
-                model = NaiveSeasonal(K=1)
-                model.historical_forecasts(
-                    series=self.ts_univariate, forecast_horizon=1, retrain=True
-                )
+        assert series_info["future_covariates"]["used"] is True
+        assert series_info["static_covariates"]["used"] is True
+        assert series_info["static_covariates"]["names"] == ["static_feat"]
+        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
+        assert tags["model_uses_future_covariates"] == "True"
+        assert tags["model_uses_past_covariates"] == "True"
+        assert tags["model_uses_static_covariates"] == "True"
 
         params = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/model_params.json"
         )
-        assert params["K"] == 1
-        series_info = mlflow.artifacts.load_dict(
-            f"runs:/{run.info.run_id}/series_info.json"
+        assert params["lags"] == 5
+
+        # model artifact is not available
+        logged_models = mlflow_tracking.search_logged_models(
+            experiment_ids=[run.info.experiment_id]
         )
-        assert series_info["series"]["names"] == self.ts_univariate.components.tolist()
-        client = mlflow.tracking.MlflowClient()
-        artifact_paths = [a.path for a in client.list_artifacts(run.info.run_id)]
-        assert "model" not in artifact_paths
-        assert (
-            client.get_run(run.info.run_id).data.tags["model_class"] == "NaiveSeasonal"
-        )
+        assert len(logged_models) == 0
 
     def test_autolog_historical_forecasts_retrain_false_skips_model_setup(
         self, mlflow_tracking, autolog_context
     ):
         """historical_forecasts(retrain=False) does not log model setup."""
         model = LinearRegressionModel(lags=5)
-        model.fit(self.ts_univariate[:40])
+        model.fit(TS_UNIVARIATE[:40])
         with autolog_context():
             with mlflow.start_run() as run:
                 model.historical_forecasts(
-                    series=self.ts_univariate,
+                    series=TS_UNIVARIATE,
                     forecast_horizon=1,
                     retrain=False,
                     start=0.5,
@@ -632,9 +494,9 @@ class TestMLflow:
         with autolog_context():
             with mlflow.start_run() as run:
                 model = LinearRegressionModel(lags=5)
-                model.fit(self.ts_univariate[:30])
+                model.fit(TS_UNIVARIATE[:30])
                 model.historical_forecasts(
-                    series=self.ts_multivariate,
+                    series=TS_MULTIVARIATE,
                     forecast_horizon=1,
                     retrain=True,
                     start=0.5,
@@ -643,14 +505,12 @@ class TestMLflow:
         series_info = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/series_info.json"
         )
-        assert (
-            series_info["series"]["names"] == self.ts_multivariate.components.tolist()
-        )
+        assert series_info["series"]["names"] == TS_MULTIVARIATE.components.tolist()
 
     def test_multivariate_with_all_covariate_types(self, mlflow_tracking):
         """Test saving/loading multivariate series with all covariate types"""
         # create multivariate target with static covariates
-        target = self.ts_multivariate.with_static_covariates(
+        target = TS_MULTIVARIATE.with_static_covariates(
             pd.DataFrame({"static_feat_1": [1.0], "static_feat_2": [2.0]})
         )
 
@@ -659,8 +519,8 @@ class TestMLflow:
         )
         model.fit(
             target[:40],
-            past_covariates=self.ts_past_cov[:40],
-            future_covariates=self.ts_future_cov[:50],
+            past_covariates=TS_PAST_COV[:40],
+            future_covariates=TS_FUTURE_COV[:50],
         )
 
         with mlflow.start_run():
@@ -673,54 +533,63 @@ class TestMLflow:
             model,
             n=5,
             series=target[:40],
-            past_covariates=self.ts_past_cov,
-            future_covariates=self.ts_future_cov,
+            past_covariates=TS_PAST_COV,
+            future_covariates=TS_FUTURE_COV,
         )
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
-    def test_pytorch_autolog_with_existing_callbacks(
-        self, mlflow_tracking, autolog_context
-    ):
-        """Test pytorch autolog works when model already has callbacks"""
-        # create model with existing callback
-        if TORCH_AVAILABLE:
-            import pytorch_lightning as pl
+    def test_autolog_pytorch(self, mlflow_tracking, autolog_context):
+        """Test that autolog logs training metrics for torch models"""
+        import pytorch_lightning as pl
+        import torchmetrics
+        from mlflow.utils.autologging_utils import autologging_is_disabled
 
-            existing_callback = pl.callbacks.EarlyStopping(monitor="train_loss")
-        else:
-            pytest.skip("PyTorch Lightning not available")
+        existing_callback = pl.callbacks.EarlyStopping(monitor="train_loss")
+        tfm_kwargs_ = copy.deepcopy(tfm_kwargs)
+        tfm_kwargs_["pl_trainer_kwargs"] = {
+            **tfm_kwargs_["pl_trainer_kwargs"],
+            "callbacks": [existing_callback],
+        }
 
         with autolog_context():
-            model = NBEATSModel(
-                input_chunk_length=4,
-                output_chunk_length=2,
-                n_epochs=2,
-                pl_trainer_kwargs={
-                    **tfm_kwargs_dev.get("pl_trainer_kwargs", {}),
-                    "callbacks": [existing_callback],
-                },
-                **{k: v for k, v in tfm_kwargs_dev.items() if k != "pl_trainer_kwargs"},
-            )
+            assert not autologging_is_disabled("pytorch")
+            with mlflow.start_run():
+                model = NBEATSModel(
+                    input_chunk_length=4,
+                    output_chunk_length=2,
+                    n_epochs=2,
+                    torch_metrics=torchmetrics.MeanAbsoluteError(),
+                    **tfm_kwargs_,
+                )
+                train, val = TS_UNIVARIATE.split_before(0.7)
+                model.fit(train, val_series=val)
+        assert autologging_is_disabled("pytorch")
 
-            train, val = self.ts_univariate.split_before(0.7)
-            model.fit(train, val_series=val)
+        # verify existing callback is still present (not removed by autolog)
+        callbacks = model.trainer_params.get("callbacks", [])
+        has_existing = any(
+            isinstance(cb, pl.callbacks.EarlyStopping) for cb in callbacks
+        )
+        assert has_existing, "Existing EarlyStopping callback should be preserved"
 
-            # verify existing callback is still present (not removed by autolog)
-            callbacks = model.trainer_params.get("callbacks", [])
-            has_existing = any(
-                isinstance(cb, pl.callbacks.EarlyStopping) for cb in callbacks
-            )
-            assert has_existing, "Existing EarlyStopping callback should be preserved"
+        runs = mlflow.search_runs()
+        assert len(runs) == 1, "Expected exactly one run"
+        last_run = runs.iloc[0]
+        last_run_id = last_run["run_id"]
+        assert last_run["tags.model_class"] == "NBEATSModel"
 
-            # verify metrics were still logged via mlflow.pytorch.autolog
-            runs = mlflow.search_runs()
-            assert len(runs) >= 1, "Expected at least one run"
-            last_run_id = runs.iloc[0]["run_id"]
-            client = mlflow.tracking.MlflowClient()
-            train_metrics = client.get_metric_history(last_run_id, "train_loss")
-            assert len(train_metrics) > 0, (
-                "Expected train_loss metrics to be logged via pytorch autolog"
-            )
+        client = mlflow.tracking.MlflowClient()
+
+        # check train_loss metrics
+        train_metrics = client.get_metric_history(last_run_id, "train_loss")
+        val_metrics = client.get_metric_history(last_run_id, "val_loss")
+        torch_metrics = client.get_metric_history(last_run_id, "val_MeanAbsoluteError")
+
+        for metrics in [train_metrics, val_metrics, torch_metrics]:
+            assert len(metrics) == 2
+            for idx, m in enumerate(metrics):
+                assert np.isfinite(m.value)
+                assert m.step == idx
 
     def test_autolog_multiple_fits(self, mlflow_tracking, autolog_context):
         """Test that multiple fits with autolog create separate runs"""
@@ -729,10 +598,10 @@ class TestMLflow:
             # so we explicitly start runs for each fit
             with mlflow.start_run():
                 model2 = LinearRegressionModel(lags=5)
-                model2.fit(self.ts_univariate)
+                model2.fit(TS_UNIVARIATE)
             with mlflow.start_run():
                 model1 = ExponentialSmoothing()
-                model1.fit(self.ts_univariate)
+                model1.fit(TS_UNIVARIATE)
 
         runs = mlflow.search_runs()
         assert len(runs) == 2, "Expected two separate runs for two fits"
@@ -763,7 +632,7 @@ class TestMLflow:
 
         with autolog_context(log_models=True):
             with mlflow.start_run() as run:
-                model.fit(self.ts_univariate)
+                model.fit(TS_UNIVARIATE)
 
         logged_models = mlflow_tracking.search_logged_models(
             experiment_ids=[run.info.experiment_id]
@@ -774,59 +643,11 @@ class TestMLflow:
         )
         assert logged_models[0].name == "RegressionEnsembleModel"
 
-    @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
-    def test_autolog_torch_model_multiple_fits(self, mlflow_tracking, autolog_context):
-        """Test autolog with multiple fits of a torch model"""
-        with autolog_context():
-            with mlflow.start_run():
-                model1 = NBEATSModel(
-                    input_chunk_length=4,
-                    output_chunk_length=2,
-                    n_epochs=1,
-                    **tfm_kwargs_dev,
-                )
-                train, val = self.ts_univariate.split_before(0.7)
-                model1.fit(train, val_series=val)
-
-            with mlflow.start_run():
-                model2 = LinearRegressionModel(lags=5)
-                model2.fit(self.ts_univariate)
-
-        runs = mlflow.search_runs()
-        assert len(runs) == 2, "Expected two separate runs for two fits"
-
-        for _, run in runs.iterrows():
-            assert run["tags.model_class"] in [
-                "NBEATSModel",
-                "LinearRegressionModel",
-            ]
-            assert run["tags.mlflow.runName"] is not None
-
-    def test_save_load_preserves_series_metadata(self, tmpdir_fn):
-        """Test that save/load preserves multivariate and static covariate structure"""
-        target = self.ts_multivariate.with_static_covariates(
-            pd.DataFrame({"stat1": [1.0], "stat2": [2.0]})
-        )
-
-        model = LinearRegressionModel(lags=5)
-        model.fit(target)
-
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
-
-        loaded_model = load_model(f"file://{model_path}")
-
-        pred_original = model.predict(n=3)
-        pred_loaded = loaded_model.predict(n=3, series=target)
-
-        # verify multivariate structure preserved
-        assert pred_original.width == pred_loaded.width == 2, (
-            "Should maintain 2 components"
-        )
-        assert pred_original.n_components == pred_loaded.n_components == 2
-
-        np.testing.assert_array_almost_equal(
-            pred_original.values(), pred_loaded.values(), decimal=4
+        assert_predictions_equal(
+            model,
+            load_model(logged_models[0].model_uri),
+            n=5,
+            series=TS_UNIVARIATE,
         )
 
     def test_load_nonexistent_model(self):
@@ -846,7 +667,7 @@ class TestMLflow:
         """Test that loading with corrupted MLmodel file fails"""
         # save a valid model
         model = LinearRegressionModel(lags=5)
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         model_path = os.path.join(tmpdir_fn, "test_model")
         save_model(model, model_path)
@@ -864,7 +685,7 @@ class TestMLflow:
         """Test that loading with missing model data file fails"""
         # save a valid model
         model = LinearRegressionModel(lags=5)
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         model_path = os.path.join(tmpdir_fn, "test_model")
         save_model(model, model_path)
@@ -891,7 +712,7 @@ class TestMLflow:
         else:
             model = model_cls()
 
-        model.fit(self.ts_univariate)
+        model.fit(TS_UNIVARIATE)
 
         model_path = os.path.join(tmpdir_fn, "test_model")
         save_model(model, model_path)
@@ -900,89 +721,41 @@ class TestMLflow:
         # Only pass series for global models (LinearRegressionModel)
         # Local models (ExponentialSmoothing) don't need it
         if isinstance(model, GlobalForecastingModel):
-            assert_predictions_equal(model, loaded, n=5, series=self.ts_univariate)
+            assert_predictions_equal(model, loaded, n=5, series=TS_UNIVARIATE)
         else:
             assert_predictions_equal(model, loaded, n=5, is_global=False)
 
     @pytest.mark.parametrize(
         "series,series_name",
         [
-            ("ts_multivariate", "multivariate"),
-            ("ts_with_static", "static_covariates"),
+            (TS_MULTIVARIATE, "multivariate"),
+            (TS_WITH_STATIC, "static_covariates"),
         ],
     )
     def test_save_load_with_special_series(self, tmpdir_fn, series, series_name):
         """Test save/load with multivariate and static covariate series"""
-        test_series = getattr(self, series)
-
         model = LinearRegressionModel(lags=5)
-        model.fit(test_series)
+        model.fit(series)
 
         model_path = os.path.join(tmpdir_fn, f"test_model_{series_name}")
         save_model(model, model_path)
 
         loaded_model = load_model(f"file://{model_path}")
 
-        assert_predictions_equal(model, loaded_model, n=3, series=test_series)
+        assert_predictions_equal(model, loaded_model, n=3, series=series)
 
         # verify the series dimensions are preserved
         pred_original = model.predict(n=3)
-        pred_loaded = loaded_model.predict(n=3, series=test_series)
+        pred_loaded = loaded_model.predict(n=3, series=series)
         assert pred_original.width == pred_loaded.width
 
-    def test_autolog_metric_logging_scalar(self, mlflow_tracking, autolog_context):
-        """Calling a darts metric inside an active run logs a scalar to MLflow."""
-        with autolog_context(log_metrics=True):
-            with mlflow.start_run() as run:
-                result = dm.mae(self.ts_univariate, self.ts_univariate * 1.1)
 
-        run_data = mlflow.get_run(run.info.run_id).data
-        assert "mae" in run_data.metrics, "mae should be logged to MLflow"
-        assert np.isfinite(run_data.metrics["mae"])
-        assert np.isscalar(result)
-        assert np.isfinite(float(result))
-
-    def test_autolog_metric_repeated_call(self, mlflow_tracking, autolog_context):
-        """Calling the same metric twice overwrites the value (last-value-wins)."""
-        with autolog_context(log_metrics=True):
-            with mlflow.start_run() as run:
-                dm.rmse(self.ts_univariate, self.ts_univariate * 1.1)
-                dm.rmse(self.ts_univariate, self.ts_univariate * 1.2)
-
-        run_data = mlflow.get_run(run.info.run_id).data
-        assert "rmse" in run_data.metrics, "rmse should be logged to MLflow"
-
-    def test_autolog_metric_per_component(self, mlflow_tracking, autolog_context):
-        """Non-scalar metric results logged per-component as {name}_{component_name}.
-
-        ts_multivariate = ts_univariate.stack(ts_univariate * 1.5), whose component
-        names are ['linear', 'linear_1'].  With component_reduction=None the result
-        is a 1-D array (one value per component), so the expected keys are
-        'mae_linear' and 'mae_linear_1'.
-        """
-        with autolog_context(log_metrics=True):
-            with mlflow.start_run() as run:
-                dm.mae(
-                    self.ts_multivariate,
-                    self.ts_multivariate * 1.1,
-                    component_reduction=None,
-                )
-
-        run_data = mlflow.get_run(run.info.run_id).data
-        assert "mae_linear" in run_data.metrics, (
-            "Component 'linear' should be logged as mae_linear"
-        )
-        assert "mae_linear_1" in run_data.metrics, (
-            "Component 'linear_1' should be logged as mae_linear_1"
-        )
-        assert np.isfinite(run_data.metrics["mae_linear"])
-        assert np.isfinite(run_data.metrics["mae_linear_1"])
-
+class TestAutoLogStandaloneMetrics:
     def test_autolog_metric_no_active_run(self, mlflow_tracking, autolog_context):
         """Calling a metric without an active run does not raise and returns correctly."""
         with autolog_context(log_metrics=True):
             # called outside any start_run — must not raise
-            result = dm.mse(self.ts_univariate, self.ts_univariate * 1.1)
+            result = dm.mse(TS_UNIVARIATE, TS_UNIVARIATE * 1.1)
 
         assert np.isscalar(result)
         assert np.isfinite(float(result))
@@ -992,13 +765,13 @@ class TestMLflow:
     ):
         """The patched metric returns the same value whether inside or outside a run."""
         with autolog_context(log_metrics=True):
-            pred = self.ts_univariate * 1.05
+            pred = TS_UNIVARIATE * 1.05
 
             with mlflow.start_run():
-                result_inside = dm.mae(self.ts_univariate, pred)
+                result_inside = dm.mae(TS_UNIVARIATE, pred)
 
             # call outside a run — no logging, same computation
-            result_outside = dm.mae(self.ts_univariate, pred)
+            result_outside = dm.mae(TS_UNIVARIATE, pred)
 
         np.testing.assert_almost_equal(result_inside, result_outside, decimal=6)
         assert np.isfinite(result_inside)
@@ -1007,7 +780,7 @@ class TestMLflow:
         """autolog(log_metrics=False) leaves metrics unpatched — nothing is logged."""
         with autolog_context(log_metrics=False):
             with mlflow.start_run() as run:
-                dm.mape(self.ts_univariate, self.ts_univariate * 1.1)
+                dm.mape(TS_UNIVARIATE, TS_UNIVARIATE * 1.1)
 
         run_data = mlflow.get_run(run.info.run_id).data
         assert "mape" not in run_data.metrics, (
@@ -1023,31 +796,19 @@ class TestMLflow:
         attribute, and `darts.metrics.mae` and `darts.metrics.metrics.mae` are
         the same function object.
         """
+        from darts.metrics import mae
+
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run_public:
-                dm.mae(self.ts_univariate, self.ts_univariate * 1.1)
-            with mlflow.start_run() as run_impl:
-                dmm.mae(self.ts_univariate, self.ts_univariate * 1.1)
+                dm.mae(TS_UNIVARIATE, TS_UNIVARIATE * 1.1)
+            with mlflow.start_run() as run_module:
+                dmm.mae(TS_UNIVARIATE, TS_UNIVARIATE * 1.1)
+            with mlflow.start_run() as run_explicit:
+                mae(TS_UNIVARIATE, TS_UNIVARIATE * 1.1)
 
         assert "mae" in mlflow.get_run(run_public.info.run_id).data.metrics
-        assert "mae" in mlflow.get_run(run_impl.info.run_id).data.metrics
-
-    def test_autolog_metric_import_order_independent(
-        self, mlflow_tracking, autolog_context
-    ):
-        """A metric imported via `from darts.metrics import <name>` *before*
-        autolog() is enabled still logs correctly, since the hook lives inside
-        the metric's own `multi_ts_support` decorator rather than patching a
-        module attribute after the fact."""
-        from darts.metrics import mae as mae_imported_before_autolog
-
-        with autolog_context(log_metrics=True):
-            with mlflow.start_run() as run:
-                mae_imported_before_autolog(
-                    self.ts_univariate, self.ts_univariate * 1.1
-                )
-
-        assert "mae" in mlflow.get_run(run.info.run_id).data.metrics
+        assert "mae" in mlflow.get_run(run_module.info.run_id).data.metrics
+        assert "mae" in mlflow.get_run(run_explicit.info.run_id).data.metrics
 
     def test_autolog_metric_internal_composite_call_not_double_logged(
         self, mlflow_tracking, autolog_context
@@ -1057,11 +818,86 @@ class TestMLflow:
         not twice (rmse and the internal mse call)."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                dm.rmse(self.ts_univariate, self.ts_univariate * 1.1)
+                dm.rmse(TS_UNIVARIATE, TS_UNIVARIATE * 1.1)
 
         metrics = mlflow.get_run(run.info.run_id).data.metrics
         assert "rmse" in metrics
         assert "mse" not in metrics
+
+    def test_autolog_metric_logging_scalar(self, mlflow_tracking, autolog_context):
+        """Calling a darts metric inside an active run logs a scalar to MLflow."""
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                result = dm.mae(TS_UNIVARIATE, TS_UNIVARIATE + 0.1)
+
+        run_data = mlflow.get_run(run.info.run_id).data
+        assert "mae" in run_data.metrics, "mae should be logged to MLflow"
+        assert run_data.metrics["mae"] == result == pytest.approx(0.1, abs=1e-5)
+
+    def test_autolog_metric_repeated_call(self, mlflow_tracking, autolog_context):
+        """Calling the same metric twice overwrites the value (last-value-wins)."""
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                dm.rmse(TS_UNIVARIATE, TS_UNIVARIATE)
+                result = dm.rmse(TS_UNIVARIATE, TS_UNIVARIATE + 2.0)
+
+        run_data = mlflow.get_run(run.info.run_id).data
+        assert "rmse" in run_data.metrics, "rmse should be logged to MLflow"
+        assert run_data.metrics["rmse"] == result == pytest.approx(2.0, abs=1e-5)
+
+    def test_autolog_metric_per_component(self, mlflow_tracking, autolog_context):
+        """Non-scalar metric results logged per-component as {name}_{component_name}.
+
+        ts_multivariate = ts_univariate.stack(ts_univariate * 1.5), whose component
+        names are ['sine', 'sine_1'].  With component_reduction=None the result
+        is a 1-D array (one value per component), so the expected keys are
+        'mae_sine' and 'mae_sine_1'.
+        """
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                result = dm.mae(
+                    TS_MULTIVARIATE,
+                    TS_MULTIVARIATE * 1.1,
+                    component_reduction=None,
+                )
+        comps = TS_MULTIVARIATE.components
+        assert result.shape == (len(comps),)
+        run_data = mlflow.get_run(run.info.run_id).data
+        for comp, value in zip(comps, result):
+            assert f"mae_{comp}" in run_data.metrics
+            assert run_data.metrics[f"mae_{comp}"] == value
+
+    def test_autolog_metric_per_component_and_q_label(
+        self, mlflow_tracking, autolog_context
+    ):
+        """Non-scalar metric results logged per-component and quantile / label as
+        {name}_{component_name}_q{quantile / label}.
+
+        E.g. ["mae_comp0_q0.100", ..., "mae_comp0_q0.900", "mae_comp1_q0.100", ..., "mae_comp1_q0.900"]
+        """
+        vals = TS_MULTIVARIATE.all_values()
+        series_prob = TS_MULTIVARIATE.with_values(
+            np.concatenate([vals * 0.9, vals, vals * 1.2], axis=2)
+        )
+        quantiles = [0.1, 0.5, 0.9]
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                result = dm.mae(
+                    TS_MULTIVARIATE,
+                    series_prob,
+                    component_reduction=None,
+                    q=quantiles,
+                )
+        comps = TS_MULTIVARIATE.components
+        assert result.shape == (len(comps) * len(quantiles),)
+        run_data = mlflow.get_run(run.info.run_id).data
+        for c_idx, comp in enumerate(comps):
+            for q_idx, q in enumerate(quantiles):
+                value = result[c_idx * len(quantiles) + q_idx]
+                assert f"mae_{comp}_q{q:.3f}" in run_data.metrics
+                assert run_data.metrics[f"mae_{comp}_q{q:.3f}"] == pytest.approx(
+                    value, abs=1e-5
+                )
 
     def test_autolog_metric_per_timestep(self, mlflow_tracking, autolog_context):
         """A per-timestep metric (ae) logs one value per timestep across MLflow steps.
@@ -1070,17 +906,14 @@ class TestMLflow:
         axis, which is mapped to the MLflow step (mirroring the backtest path)
         rather than being mislabeled as per-component.
         """
-        train = self.ts_univariate[:40]
-        model = LinearRegressionModel(lags=4)
-        model.fit(train)
-        pred = model.predict(n=10)
-        actual = self.ts_univariate[40:]
-
+        actual = TS_UNIVARIATE[40:]
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = dm.ae(actual, pred)
+                ref = dm.ae(actual, actual + 1.0)
 
         ref = np.asarray(ref, dtype=float)  # shape (n_timesteps,)
+        assert ref.shape == (len(actual),)
+
         history = mlflow_tracking.get_metric_history(run.info.run_id, "ae")
         assert len(history) == len(ref), "Expected one step per timestep"
         steps = sorted(m.step for m in history)
@@ -1088,11 +921,47 @@ class TestMLflow:
         logged = [m.value for m in sorted(history, key=lambda m: m.step)]
         np.testing.assert_allclose(logged, ref, atol=1e-5)
 
+    def test_autolog_metric_per_timestep_component_and_q_label(
+        self, mlflow_tracking, autolog_context
+    ):
+        """A per-timestep metric (ae) logs one value per timestep and component and quantile / label as
+        {name}_{component_name}_q{quantile / label}.
+
+        E.g. ["mae_comp0_q0.100", ..., "mae_comp0_q0.900", "mae_comp1_q0.100", ..., "mae_comp1_q0.900"]
+        """
+        actual = TS_MULTIVARIATE[40:]
+        vals = actual.all_values()
+        series_prob = actual.with_values(
+            np.concatenate([vals * 0.9, vals, vals * 1.2], axis=2)
+        )
+        quantiles = [0.1, 0.5, 0.9]
+        comps = actual.components
+
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = dm.ae(actual, series_prob, component_reduction=None, q=quantiles)
+
+        ref = np.asarray(ref, dtype=float)
+        assert ref.shape == (len(actual), len(comps) * len(quantiles))
+
+        for c_idx, comp in enumerate(comps):
+            for q_idx, q in enumerate(quantiles):
+                history = mlflow_tracking.get_metric_history(
+                    run.info.run_id, f"ae_{comp}_q{q:.3f}"
+                )
+                assert len(history) == len(ref)
+                steps = sorted(m.step for m in history)
+                assert steps == list(range(len(actual)))
+                logged = [m.value for m in sorted(history, key=lambda m: m.step)]
+                np.testing.assert_allclose(
+                    logged, ref[:, c_idx * len(quantiles) + q_idx], atol=1e-5
+                )
+
     def test_autolog_metric_aligns_time_axis_by_forecast_position(
         self, mlflow_tracking, autolog_context
     ):
         """Each series starts at forecast position zero."""
-        ts_long = self.ts_univariate  # length 50
+        ts_long = TS_UNIVARIATE  # length 50
         ts_short = ts_long[10:]  # length 40, same end, starts 10 steps later
 
         # distinct constant error per series, so a step's mean reveals exactly
@@ -1112,7 +981,7 @@ class TestMLflow:
         for step in range(40, 50):
             assert by_step[step] == pytest.approx(1.0, abs=1e-4), step
 
-        rows = self._read_per_series_table(run.info.run_id)
+        rows = _read_per_series_table(run.info.run_id)
         steps_by_series = {0: set(), 1: set()}
         for r in rows:
             steps_by_series[r["series_index"]].add(r["step"])
@@ -1121,19 +990,20 @@ class TestMLflow:
 
     def test_autolog_metric_quantile(self, mlflow_tracking, autolog_context):
         """A quantile metric (mql) logs one key per quantile with matching values."""
-        train = self.ts_univariate[:40]
-        model = LinearRegressionModel(
-            lags=4, likelihood="quantile", quantiles=[0.1, 0.5, 0.9]
+        actual = TS_UNIVARIATE[40:]
+        vals = actual.all_values()
+        pred = actual.with_values(
+            np.concatenate([vals - 1.0, vals, vals + 1.0], axis=2)
         )
-        model.fit(train)
-        pred = model.predict(n=10, num_samples=200)
-        actual = self.ts_univariate[40:]
 
+        quantiles = [0.1, 0.5, 0.9]
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = dm.mql(actual, pred, q=[0.1, 0.5, 0.9])
+                ref = dm.mql(actual, pred, q=quantiles)
 
         ref = np.asarray(ref, dtype=float)  # shape (n_quantiles,)
+        assert ref.shape == (len(quantiles),)
+
         m = mlflow.get_run(run.info.run_id).data.metrics
         for i, key in enumerate(("mql_q0.100", "mql_q0.500", "mql_q0.900")):
             assert key in m, f"Expected quantile key {key}"
@@ -1141,38 +1011,45 @@ class TestMLflow:
 
     def test_autolog_metric_quantile_interval(self, mlflow_tracking, autolog_context):
         """A quantile interval metric (miw) logs one key per interval."""
-        train = self.ts_univariate[:40]
-        model = LinearRegressionModel(
-            lags=4, likelihood="quantile", quantiles=[0.1, 0.5, 0.9]
+        actual = TS_UNIVARIATE[40:]
+        vals = actual.all_values()
+        pred = actual.with_values(
+            np.concatenate([vals - 1.0, vals, vals + 1.0], axis=2)
         )
-        model.fit(train)
-        pred = model.predict(n=10, num_samples=200)
-        actual = self.ts_univariate[40:]
 
+        q_intervals = [(0.1, 0.9), (0.2, 0.8)]
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = dm.miw(actual, pred, q_interval=(0.1, 0.9))
+                ref = dm.miw(
+                    actual,
+                    pred,
+                    q_interval=q_intervals,
+                )
 
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (len(q_intervals),)
         m = mlflow.get_run(run.info.run_id).data.metrics
-        assert "miw_qi0.800" in m
-        assert m["miw_qi0.800"] == pytest.approx(float(ref), abs=1e-5)
+        for i, key in enumerate(("miw_qi0.800", "miw_qi0.600")):
+            assert key in m, f"Expected quantile key {key}"
+            assert m[key] == pytest.approx(ref[i], abs=1e-5)
 
     def test_autolog_metric_multi_series(self, mlflow_tracking, autolog_context):
         """A list of series logs the mean over series; per-series values go to a table."""
-        series = [self.ts_univariate, self.ts_univariate * 1.2]
+        series = [TS_UNIVARIATE, TS_UNIVARIATE * 1.2]
         pred = [s * 1.1 for s in series]
 
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
                 ref = dm.mae(series, pred)
 
-        ref = np.asarray(ref, dtype=float)  # shape (n_series,)
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (len(series),)
         m = mlflow.get_run(run.info.run_id).data.metrics
-        # aggregate = mean over series, no per-series _s{i} keys
-        assert m["mae"] == pytest.approx(float(np.mean(ref)), abs=1e-5)
+        # agg_func = np.nanmean over series, no per-series _s{i} keys
+        assert m["mae"] == pytest.approx(float(np.nanmean(ref)), abs=1e-5)
         assert not any(k.startswith("mae_s") for k in m)
         # granular per-series breakdown written to a table artifact
-        rows = self._read_per_series_table(run.info.run_id)
+        rows = _read_per_series_table(run.info.run_id)
         by_series = {int(row["series_index"]): float(row["value"]) for row in rows}
         assert by_series == pytest.approx({0: ref[0], 1: ref[1]}, abs=1e-5)
 
@@ -1182,7 +1059,7 @@ class TestMLflow:
         """autolog()'s agg_func controls how per-series values are aggregated
         into the single logged metric (default np.mean)."""
         # 3 series with distinct, asymmetric per-series errors so median != mean
-        series = [self.ts_univariate * f for f in (1.0, 1.2, 5.0)]
+        series = [TS_UNIVARIATE * f for f in (1.0, 1.2, 5.0)]
         pred = [s * 1.1 for s in series]
 
         with autolog_context(log_metrics=True, agg_func=np.median):
@@ -1199,37 +1076,39 @@ class TestMLflow:
     ):
         """A list of multivariate series with component_reduction=None logs the
         per-component mean over series; the CSV carries one row per (component, series)."""
-        series = [self.ts_multivariate, self.ts_multivariate * 1.2]
+        series = [TS_MULTIVARIATE, TS_MULTIVARIATE * 1.2]
         pred = [s * 1.1 for s in series]
 
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
                 ref = dm.mae(series, pred, component_reduction=None)
 
-        ref = np.asarray(ref, dtype=float)  # shape (n_series, n_components)
+        ref = np.asarray(ref, dtype=float)
+        assert ref.shape == (len(series), len(series[0].components))
+
         m = mlflow.get_run(run.info.run_id).data.metrics
         # aggregate per component = mean over series, no per-series _s{i} keys
-        assert m["mae_linear"] == pytest.approx(float(ref[:, 0].mean()), abs=1e-5)
-        assert m["mae_linear_1"] == pytest.approx(float(ref[:, 1].mean()), abs=1e-5)
+        assert m["mae_sine"] == pytest.approx(float(ref[:, 0].mean()), abs=1e-5)
+        assert m["mae_sine_1"] == pytest.approx(float(ref[:, 1].mean()), abs=1e-5)
         assert not any(k.endswith(("_s0", "_s1")) for k in m)
         # granular CSV: one row per (component, series)
-        rows = self._read_per_series_table(run.info.run_id)
+        rows = _read_per_series_table(run.info.run_id)
         got = {
             (row["key"], int(row["series_index"])): float(row["value"]) for row in rows
         }
-        assert got[("mae_linear", 0)] == pytest.approx(ref[0, 0], abs=1e-5)
-        assert got[("mae_linear", 1)] == pytest.approx(ref[1, 0], abs=1e-5)
-        assert got[("mae_linear_1", 0)] == pytest.approx(ref[0, 1], abs=1e-5)
-        assert got[("mae_linear_1", 1)] == pytest.approx(ref[1, 1], abs=1e-5)
+        assert got[("mae_sine", 0)] == pytest.approx(ref[0, 0], abs=1e-5)
+        assert got[("mae_sine", 1)] == pytest.approx(ref[1, 0], abs=1e-5)
+        assert got[("mae_sine_1", 0)] == pytest.approx(ref[0, 1], abs=1e-5)
+        assert got[("mae_sine_1", 1)] == pytest.approx(ref[1, 1], abs=1e-5)
 
     def test_autolog_metric_name_override(self, mlflow_tracking, autolog_context):
         """The metric `name` kwarg overrides only the metric-name token in the key,
         keeping the backtest prefix and the quantile/axis suffixes."""
-        actual = self.ts_univariate
-        train = self.ts_univariate[:40]
-        qmodel = self._fit_qlr(train)
+        actual = TS_UNIVARIATE
+        train = TS_UNIVARIATE[:40]
+        qmodel = _fit_qlr(train)
         pred = qmodel.predict(n=10, num_samples=200)
-        target = self.ts_univariate[40:]
+        target = TS_UNIVARIATE[40:]
 
         with autolog_context(log_metrics=True):
             # direct call: name replaces the metric token; suffix (_q0_500) preserved
@@ -1238,12 +1117,13 @@ class TestMLflow:
                 dm.mql(target, pred, q=0.5, name="myq")
             # backtest: name replaces the metric token; backtest_ prefix preserved
             with mlflow.start_run() as run_bt:
-                self._fit_lr().backtest(
-                    self.ts_univariate,
+                _fit_lr().backtest(
+                    TS_UNIVARIATE,
+                    forecast_horizon=1,
+                    start=-1,
                     metric=dm.mae,
                     metric_kwargs={"name": "custom"},
                     retrain=False,
-                    stride=10,
                 )
 
         direct = mlflow.get_run(run_direct.info.run_id).data.metrics
@@ -1273,11 +1153,13 @@ class TestMLflow:
         series = [binary1, binary2]
         pred = series  # perfect predictions → f1 == 1.0 per label per series
 
+        labels = [0, 1]
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = dm.f1(series, pred, label_reduction=None, labels=[0, 1])
+                ref = dm.f1(series, pred, label_reduction=None, labels=labels)
 
-        ref = [np.asarray(r, dtype=float).flatten() for r in ref]
+        ref = np.array(ref)
+        assert ref.shape == (len(series), len(labels))
         m = mlflow.get_run(run.info.run_id).data.metrics
         # aggregate per label = mean over series, no per-series _s{i} keys
         assert m["f1_label0"] == pytest.approx(
@@ -1288,7 +1170,7 @@ class TestMLflow:
         )
         assert not any(k.endswith(("_s0", "_s1")) for k in m)
         # granular CSV: one row per (label, series)
-        rows = self._read_per_series_table(run.info.run_id)
+        rows = _read_per_series_table(run.info.run_id)
         got = {
             (row["key"], int(row["series_index"])): float(row["value"]) for row in rows
         }
@@ -1301,7 +1183,7 @@ class TestMLflow:
     ):
         """Default mae reduces components to scalars, so mixed component counts
         are valid and log under a single aggregated key."""
-        series = [self.ts_univariate, self.ts_multivariate]
+        series = [TS_UNIVARIATE, TS_MULTIVARIATE]
         pred = [s * 1.1 for s in series]
 
         with autolog_context(log_metrics=True):
@@ -1316,7 +1198,7 @@ class TestMLflow:
     ):
         """When components are preserved, mixed component counts raise rather
         than taking names from the first series and mislabeling the rest."""
-        series = [self.ts_univariate, self.ts_multivariate]
+        series = [TS_UNIVARIATE, TS_MULTIVARIATE]
         pred = [s * 1.1 for s in series]
 
         with autolog_context(log_metrics=True):
@@ -1333,13 +1215,13 @@ class TestMLflow:
         (and logs an error), propagating out of the public metric call — the
         metric callback isn't invoked through MLflow's safe_patch, so nothing
         catches it. No metrics are written for the failed call."""
-        actual = self.ts_univariate[40:]
+        actual = TS_UNIVARIATE[40:]
         # mae with component_reduction=None on a univariate series produces shape (T,),
         # which is size T — divisible by c_size=1 (1 component × 1 quantile), so we
         # need to force a mismatch.  We do that by monkey-patching _infer_metric_axes
         # to report has_comp_axis=True with a fake 3-component count, making c_size=3
         # while the actual result is shape (T,).
-        train = self.ts_univariate[:40]
+        train = TS_UNIVARIATE[:40]
         model = LinearRegressionModel(lags=4)
         model.fit(train)
         pred = model.predict(n=10)
@@ -1373,13 +1255,14 @@ class TestMLflow:
         """The per-series table has the expected schema for multi-series input, and no
         artifact is written for single-series input (mean == the value itself)."""
         # multi-series: artifact exists with the documented columns
-        multi = [self.ts_univariate, self.ts_univariate * 1.2]
+        multi = [TS_UNIVARIATE, TS_UNIVARIATE * 1.2]
         pred_multi = [s * 1.1 for s in multi]
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run_multi:
-                dm.mae(multi, pred_multi)
+                ref = np.asarray(dm.mae(multi, pred_multi), dtype=float)
 
-        rows = self._read_per_series_table(run_multi.info.run_id)
+        assert ref.shape == (len(multi),)
+        rows = _read_per_series_table(run_multi.info.run_id)
         assert list(rows[0].keys()) == [
             "key",
             "series_index",
@@ -1387,10 +1270,15 @@ class TestMLflow:
             "window_index",
             "value",
         ]
-        assert {int(r["series_index"]) for r in rows} == {0, 1}
+        for idx, (row, ref_i) in enumerate(zip(rows, ref)):
+            assert row["key"] == "mae"
+            assert int(row["series_index"]) == idx
+            assert np.isnan(row["step"])
+            assert np.isnan(row["window_index"])
+            assert row["value"] == pytest.approx(ref_i, abs=1e-5)
 
         # single-series: no per-series table artifact should be created
-        single = self.ts_univariate
+        single = TS_UNIVARIATE
         pred_single = single * 1.1
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run_single:
@@ -1401,71 +1289,199 @@ class TestMLflow:
             "Single-series input should not write a per-series table artifact"
         )
 
+
+class TestAutoLogBacktestMetrics:
     def test_autolog_backtest_scalar(self, mlflow_tracking, autolog_context):
         """Default (reduced) backtest of a single univariate series logs one scalar."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = self._fit_lr().backtest(
-                    self.ts_univariate, metric=dm.mae, retrain=False, stride=10
+                ref = _fit_lr().backtest(
+                    TS_UNIVARIATE, metric=dm.mae, retrain=False, start=-2
                 )
-
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (1,)
         run_data = mlflow.get_run(run.info.run_id).data
         assert "backtest_mae" in run_data.metrics
-        assert run_data.metrics["backtest_mae"] == pytest.approx(float(ref), abs=1e-5)
+        np.testing.assert_almost_equal(run_data.metrics["backtest_mae"], ref)
 
     def test_autolog_backtest_per_window_steps(self, mlflow_tracking, autolog_context):
-        """reduction=None logs per-window values at end-relative steps."""
+        """reduction=None logs per-window values at steps."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = self._fit_lr().backtest(
-                    self.ts_univariate,
+                ref = _fit_lr().backtest(
+                    TS_UNIVARIATE,
                     metric=dm.mae,
                     retrain=False,
-                    stride=10,
+                    start=-2,
                     reduction=None,
                 )
 
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (2,)
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
-        assert len(history) > 1, "Expected multiple per-window steps"
+        assert len(history) == 2
         steps = sorted(m.step for m in history)
         assert steps == list(range(len(history)))
         logged = [m.value for m in sorted(history, key=lambda m: m.step)]
-        np.testing.assert_allclose(logged, np.asarray(ref, dtype=float), atol=1e-5)
+        np.testing.assert_array_almost_equal(logged, ref)
 
     def test_autolog_backtest_per_component(self, mlflow_tracking, autolog_context):
         """component_reduction=None logs one key per component name."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = self._fit_lr(self.ts_multivariate).backtest(
-                    self.ts_multivariate,
+                ref = _fit_lr(TS_MULTIVARIATE).backtest(
+                    TS_MULTIVARIATE,
                     metric=dm.mae,
                     retrain=False,
-                    stride=10,
+                    start=-2,
                     metric_kwargs={"component_reduction": None},
                 )
 
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (TS_MULTIVARIATE.n_components,)
         run_data = mlflow.get_run(run.info.run_id).data
-        assert "backtest_mae_linear" in run_data.metrics
-        assert "backtest_mae_linear_1" in run_data.metrics
+        assert "backtest_mae_sine" in run_data.metrics
+        assert "backtest_mae_sine_1" in run_data.metrics
         ref = np.asarray(ref, dtype=float)
-        assert run_data.metrics["backtest_mae_linear"] == pytest.approx(
-            ref[0], abs=1e-5
-        )
-        assert run_data.metrics["backtest_mae_linear_1"] == pytest.approx(
+        assert run_data.metrics["backtest_mae_sine"] == pytest.approx(ref[0], abs=1e-5)
+        assert run_data.metrics["backtest_mae_sine_1"] == pytest.approx(
             ref[1], abs=1e-5
         )
 
-    def test_autolog_backtest_multi_metric(self, mlflow_tracking, autolog_context):
-        """Multiple metrics are logged under one key each."""
+    def test_autolog_backtest_per_component_and_q_label(
+        self, mlflow_tracking, autolog_context
+    ):
+        """Aggregated windows; component_reduction=None logs one key per component name and
+        quantile / label as {name}_{component_name}_q{quantile / label}.
+
+        E.g. ["backtest_mae_comp0_q0.100", ..., "backtest_mae_comp0_q0.900", "backtest_mae_comp1_q0.100",
+        ..., "backtest_mae_comp1_q0.900"]
+        """
+        quantiles = [0.1, 0.5, 0.9]
+        comps = TS_MULTIVARIATE.components
+        n_windows = 2
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = self._fit_lr().backtest(
-                    self.ts_univariate,
-                    metric=[dm.mae, dm.rmse],
+                ref = _fit_qlr(TS_MULTIVARIATE).backtest(
+                    TS_MULTIVARIATE,
+                    metric=dm.mae,
                     retrain=False,
-                    stride=10,
+                    start=-n_windows,
+                    num_samples=3,
+                    metric_kwargs={"component_reduction": None, "q": quantiles},
+                    reduction=np.nanmean,
+                )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (len(comps) * len(quantiles),)
+
+        run_data = mlflow.get_run(run.info.run_id).data
+        for c_idx, comp in enumerate(comps):
+            for q_idx, q in enumerate(quantiles):
+                name = f"backtest_mae_{comp}_q{q:.3f}"
+                assert name in run_data.metrics
+                assert run_data.metrics[name] == pytest.approx(
+                    ref[c_idx * len(quantiles) + q_idx], abs=1e-5
                 )
 
+    def test_autolog_backtest_per_window_component_and_q_label(
+        self, mlflow_tracking, autolog_context
+    ):
+        """Stepped window metrics; component_reduction=None logs one key per window, component name and
+        quantile / label as {name}_{component_name}_q{quantile / label}.
+
+        E.g. ["backtest_mae_comp0_q0.100", ..., "backtest_mae_comp0_q0.900", "backtest_mae_comp1_q0.100",
+        ..., "backtest_mae_comp1_q0.900"]
+        """
+        quantiles = [0.1, 0.5, 0.9]
+        comps = TS_MULTIVARIATE.components
+        n_windows = 2
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = _fit_qlr(TS_MULTIVARIATE).backtest(
+                    TS_MULTIVARIATE,
+                    metric=dm.mae,
+                    retrain=False,
+                    start=-n_windows,
+                    num_samples=3,
+                    metric_kwargs={"component_reduction": None, "q": quantiles},
+                    reduction=None,
+                )
+        ref = np.atleast_2d(ref)
+        assert ref.shape == (n_windows, len(comps) * len(quantiles))
+
+        for c_idx, comp in enumerate(comps):
+            for q_idx, q in enumerate(quantiles):
+                history = mlflow_tracking.get_metric_history(
+                    run.info.run_id, f"backtest_mae_{comp}_q{q:.3f}"
+                )
+                assert len(history) == len(ref)
+                steps = sorted(m.step for m in history)
+                assert steps == list(range(len(ref)))
+                logged = [m.value for m in sorted(history, key=lambda m: m.step)]
+                np.testing.assert_allclose(
+                    logged, ref[:, c_idx * len(quantiles) + q_idx], atol=1e-5
+                )
+
+    @pytest.mark.parametrize("reduction", [None, np.nanmean])
+    def test_autolog_backtest_per_timestep_component_and_q_label(
+        self, mlflow_tracking, autolog_context, reduction
+    ):
+        """Stepped horizon metrics; component_reduction=None logs one key per window, component name and
+        quantile / label as {name}_{component_name}_q{quantile / label}.
+
+        E.g. ["backtest_mae_comp0_q0.100", ..., "backtest_mae_comp0_q0.900", "backtest_mae_comp1_q0.100",
+        ..., "backtest_mae_comp1_q0.900"]
+        """
+        quantiles = [0.1, 0.5, 0.9]
+        comps = TS_MULTIVARIATE.components
+        horizon = 3
+        n_windows = 2
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = _fit_qlr(TS_MULTIVARIATE).backtest(
+                    TS_MULTIVARIATE,
+                    metric=dm.ae,
+                    retrain=False,
+                    start=-(horizon + n_windows - 1),
+                    forecast_horizon=horizon,
+                    num_samples=3,
+                    metric_kwargs={"component_reduction": None, "q": quantiles},
+                    reduction=reduction,
+                )
+        if reduction is None:
+            assert ref.shape == (n_windows, horizon, len(comps) * len(quantiles))
+            ref = np.nanmean(ref, axis=0)
+
+        ref = np.atleast_2d(ref)
+        assert ref.shape == (horizon, len(comps) * len(quantiles))
+
+        for c_idx, comp in enumerate(comps):
+            for q_idx, q in enumerate(quantiles):
+                history = mlflow_tracking.get_metric_history(
+                    run.info.run_id, f"backtest_ae_{comp}_q{q:.3f}"
+                )
+                assert len(history) == len(ref)
+                steps = sorted(m.step for m in history)
+                assert steps == list(range(len(ref)))
+                logged = [m.value for m in sorted(history, key=lambda m: m.step)]
+                np.testing.assert_allclose(
+                    logged, ref[:, c_idx * len(quantiles) + q_idx], atol=1e-5
+                )
+
+    def test_autolog_backtest_multi_metric(self, mlflow_tracking, autolog_context):
+        """Multiple metrics are logged under one key each."""
+        metrics = [dm.mae, dm.rmse]
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = _fit_lr().backtest(
+                    TS_UNIVARIATE,
+                    metric=metrics,
+                    retrain=False,
+                    start=-2,
+                )
+
+        ref = np.array(ref)
+        assert ref.shape == (len(metrics),)
         run_data = mlflow.get_run(run.info.run_id).data
         assert "backtest_mae" in run_data.metrics
         assert "backtest_rmse" in run_data.metrics
@@ -1478,12 +1494,14 @@ class TestMLflow:
 
     def test_autolog_backtest_multi_series(self, mlflow_tracking, autolog_context):
         """A list of series logs the mean over series; per-series values go to a table."""
-        series = [self.ts_univariate, self.ts_univariate * 1.2]
+        series = [TS_UNIVARIATE, TS_UNIVARIATE * 1.2]
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = self._fit_lr(series).backtest(
-                    series, metric=dm.mae, retrain=False, stride=10
+                ref = _fit_lr(series).backtest(
+                    series, metric=dm.mae, retrain=False, start=-2
                 )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (len(series),)
 
         run_data = mlflow.get_run(run.info.run_id).data
         # aggregate = mean over series, no per-series _s{i} keys
@@ -1492,96 +1510,115 @@ class TestMLflow:
         )
         assert not any(k.startswith("backtest_mae_s") for k in run_data.metrics)
         # granular per-series breakdown written to a table artifact
-        rows = self._read_per_series_table(run.info.run_id)
+        rows = _read_per_series_table(run.info.run_id)
         by_series = {int(row["series_index"]): float(row["value"]) for row in rows}
         assert by_series == pytest.approx(
             {0: float(ref[0]), 1: float(ref[1])}, abs=1e-5
         )
 
-    def test_autolog_backtest_multi_series_custom_agg_func(self, mlflow_tracking):
+    @pytest.mark.parametrize("horizon", [1, 3])
+    def test_autolog_backtest_multi_series_custom_agg_func(
+        self, autolog_context, mlflow_tracking, horizon
+    ):
         """autolog()'s agg_func also controls the backtest() aggregation
         (default np.mean). Calls _log_backtest_metrics directly with a
         fabricated result so the per-series values are exact."""
-        backtest_args = {
-            "metric": dm.mae,
-            "metric_kwargs": {},
-            "series": [self.ts_univariate, self.ts_univariate, self.ts_univariate],
-            "forecast_horizon": 1,
-            "reduction": np.mean,
-            "last_points_only": True,
-        }
-        result = [1.0, 2.0, 100.0]  # asymmetric -> median != mean
-
-        with mlflow.start_run() as run:
-            client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(
-                client,
-                run.info.run_id,
-                result,
-                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
-                agg_func=np.median,
-            )
-            client.flush(synchronous=True)
-
-        m = mlflow.get_run(run.info.run_id).data.metrics
-        assert m["backtest_mae"] == pytest.approx(2.0)
-
-    def test_autolog_backtest_per_timestep_scalar(
-        self, mlflow_tracking, autolog_context
-    ):
-        """A per-timestep metric (ae) under default reduction collapses to one scalar."""
-        with autolog_context(log_metrics=True):
+        series = TS_UNIVARIATE
+        series = [series] * 3
+        with autolog_context(log_metrics=True, agg_func=np.median):
             with mlflow.start_run() as run:
-                ref = self._fit_lr().backtest(
-                    self.ts_univariate, metric=dm.ae, retrain=False, stride=10
+                ref = _fit_lr(series[0]).backtest(
+                    metric=dm.mae,
+                    series=series,
+                    last_points_only=True,
+                    start=-(horizon + 1),
+                    forecast_horizon=horizon,
                 )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (len(series),)  # (n_series,)
+        m = mlflow.get_run(run.info.run_id).data.metrics
 
-        history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
-        assert len(history) == 1, "Default reduction should yield a single value"
-        assert history[0].value == pytest.approx(float(ref), abs=1e-5)
+        assert m["backtest_mae"] == pytest.approx(np.median(ref))
 
-    def test_autolog_backtest_per_timestep_per_window(
-        self, mlflow_tracking, autolog_context
+    @pytest.mark.parametrize("horizon", [1, 3])
+    def test_autolog_backtest_per_timestep_with_reduction(
+        self, mlflow_tracking, autolog_context, horizon
     ):
-        """Window-level ae results aggregate per horizon step in the chart and
-        remain available with their window index in the detailed table."""
+        """A per-timestep metric (ae) under default reduction collapses to one
+        scalar per forecast horizon."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                ref = self._fit_lr().backtest(
-                    self.ts_univariate,
+                ref = _fit_lr().backtest(
+                    TS_UNIVARIATE,
                     metric=dm.ae,
                     retrain=False,
-                    stride=10,
-                    forecast_horizon=4,
+                    start=-(horizon + 1),
+                    last_points_only=False,
+                    forecast_horizon=horizon,
+                    reduction=np.nanmean,
+                )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (horizon,)  # (n_windows, horizon)
+        history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
+        assert len(history) == horizon, "Default reduction should yield a single value"
+        values = [m.value for m in sorted(history, key=lambda m: m.step)]
+        np.testing.assert_array_almost_equal(values, ref)
+
+        # no per-series table due to reduction
+        with pytest.raises(mlflow.exceptions.MlflowException):
+            _ = _read_per_series_table(run.info.run_id)
+
+    @pytest.mark.parametrize("horizon", [1, 3])
+    def test_autolog_backtest_per_timestep_without_reduction(
+        self, mlflow_tracking, autolog_context, horizon
+    ):
+        """A per-timestep metric (ae) under default reduction collapses to one
+        scalar per forecast horizon."""
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = _fit_lr().backtest(
+                    TS_UNIVARIATE,
+                    metric=dm.ae,
+                    retrain=False,
+                    start=-(horizon + 1),
+                    last_points_only=False,
+                    forecast_horizon=horizon,
                     reduction=None,
                 )
-
-        ref = np.asarray(ref, dtype=float)  # shape (n_windows, forecast_horizon)
+        n_windows = 2
+        ref = np.atleast_2d(ref)
+        ref = ref.T if ref.shape[1] == n_windows else ref
+        assert ref.shape == (n_windows, horizon)  # (n_windows, horizon)
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
-        assert len(history) == 4, "Expected one step per forecast horizon timestep"
-        logged = [m.value for m in sorted(history, key=lambda m: m.step)]
-        np.testing.assert_allclose(logged, np.nanmean(ref, axis=0), atol=1e-5)
+        assert len(history) == horizon, "Default reduction should yield a single value"
+        values = [m.value for m in sorted(history, key=lambda m: m.step)]
+        np.testing.assert_array_almost_equal(values, np.nanmean(ref, axis=0))
 
-        rows = self._read_per_series_table(run.info.run_id)
+        rows = _read_per_series_table(run.info.run_id)
         assert len(rows) == ref.size
-        for row in rows:
-            assert row["key"] == "backtest_ae"
-            assert row["window_index"] in range(len(ref))
-        assert {int(r["window_index"]) for r in rows} == set(range(len(ref)))
+        for t_idx in range(horizon):
+            for w_idx in range(n_windows):  # windows
+                row = rows[t_idx * n_windows + w_idx]
+                assert row["key"] == "backtest_ae"
+                assert row["series_index"] == 0
+                assert row["step"] == t_idx
+                assert row["window_index"] == w_idx
+                assert row["value"] == pytest.approx(ref[w_idx, t_idx])
 
+    @pytest.mark.parametrize("horizon", [1, 3])
     def test_autolog_backtest_historical_forecasts_horizon_inferred(
-        self, mlflow_tracking, autolog_context
+        self, mlflow_tracking, autolog_context, horizon
     ):
         """When `historical_forecasts` is user-supplied, `backtest()` ignores the
         `forecast_horizon` argument, autologging must infer the true window
         length from the historical forecasts themselves, not from the (unused,
         defaulted) `forecast_horizon` argument."""
-        model = self._fit_lr()
+        model = _fit_lr()
         hf = model.historical_forecasts(
-            self.ts_univariate,
+            TS_UNIVARIATE,
             retrain=False,
-            stride=10,
-            forecast_horizon=4,
+            start=-(horizon + 1),
+            forecast_horizon=horizon,
             last_points_only=False,
         )
         with autolog_context(log_metrics=True):
@@ -1589,15 +1626,20 @@ class TestMLflow:
                 # forecast_horizon is not passed (defaults to 1) and would be
                 # wrong; the real horizon (4) must come from `hf`.
                 ref = model.backtest(
-                    self.ts_univariate,
+                    TS_UNIVARIATE,
                     historical_forecasts=hf,
                     metric=dm.ae,
                     reduction=None,
                 )
 
-        ref = np.asarray(ref, dtype=float)  # shape (n_windows, forecast_horizon)
+        n_windows = 2
+        ref = np.atleast_2d(ref)
+        ref = ref.T if ref.shape[1] == n_windows else ref
+        assert ref.shape == (n_windows, horizon)
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
-        assert len(history) == 4, "Expected one step per forecast horizon timestep"
+        assert len(history) == horizon, (
+            "Expected one step per forecast horizon timestep"
+        )
         logged = [m.value for m in sorted(history, key=lambda m: m.step)]
         np.testing.assert_allclose(logged, np.nanmean(ref, axis=0), atol=1e-5)
 
@@ -1605,23 +1647,25 @@ class TestMLflow:
         """A quantile metric (mql) logs one key per quantile."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                self._fit_qlr().backtest(
-                    self.ts_univariate,
+                ref = _fit_qlr().backtest(
+                    TS_UNIVARIATE,
                     metric=dm.mql,
                     metric_kwargs={"q": [0.1, 0.5, 0.9]},
                     retrain=False,
-                    stride=10,
+                    start=-2,
                     num_samples=200,
                 )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (3,)  # (n_quantiles,)
 
         m = mlflow.get_run(run.info.run_id).data.metrics
-        for key in (
+        for idx, key in enumerate([
             "backtest_mql_q0.100",
             "backtest_mql_q0.500",
             "backtest_mql_q0.900",
-        ):
+        ]):
             assert key in m, f"Expected quantile key {key}"
-            assert np.isfinite(m[key])
+            assert m[key] == pytest.approx(ref[idx])
 
     def test_autolog_backtest_mixed_degenerate_axes_keep_metric_names(
         self, mlflow_tracking, autolog_context
@@ -1629,11 +1673,11 @@ class TestMLflow:
         """Metrics whose differing axes have size one keep their metric names."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                self._fit_lr().backtest(
-                    self.ts_univariate,
+                _ = _fit_lr().backtest(
+                    TS_UNIVARIATE,
                     metric=[dm.mae, dm.ae],
                     retrain=False,
-                    stride=10,
+                    start=-2,
                 )
 
         m = mlflow.get_run(run.info.run_id).data.metrics
@@ -1647,12 +1691,12 @@ class TestMLflow:
         """f1 with explicit labels present in the series logs finite per-label keys."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                self._fit_lr(self.ts_binary).backtest(
-                    self.ts_binary,
+                _fit_lr(TS_BINARY).backtest(
+                    TS_BINARY,
                     metric=dm.f1,
                     metric_kwargs={"label_reduction": None, "labels": [0, 1]},
                     retrain=False,
-                    stride=10,
+                    start=10,
                 )
 
         m = mlflow.get_run(run.info.run_id).data.metrics
@@ -1668,8 +1712,8 @@ class TestMLflow:
         the scores are NaN (the labels never appear in any window)."""
         with autolog_context(log_metrics=True):
             with mlflow.start_run() as run:
-                self._fit_lr(self.ts_binary).backtest(
-                    self.ts_binary,
+                _fit_lr(TS_BINARY).backtest(
+                    TS_BINARY,
                     metric=dm.f1,
                     metric_kwargs={"label_reduction": None, "labels": [5, 10]},
                     retrain=False,
@@ -1683,32 +1727,28 @@ class TestMLflow:
         assert np.isnan(m["backtest_f1_label10"])
 
     def test_log_backtest_metrics_component_count_mismatch_allowed_when_reduced(
-        self, mlflow_tracking
+        self, autolog_context, mlflow_tracking
     ):
         """Default mae reduces components to scalars, so mixed component counts
         aggregate normally. Calls _log_backtest_metrics directly."""
-        backtest_args = {
-            "metric": dm.mae,
-            "metric_kwargs": {},
-            "series": [self.ts_univariate, self.ts_multivariate],
-            "forecast_horizon": 1,
-            "reduction": np.mean,
-            "last_points_only": True,
-        }
-        result = [1.0, 3.0]
 
-        with mlflow.start_run() as run:
-            client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(
-                client,
-                run.info.run_id,
-                result,
-                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
-            )
-            client.flush(synchronous=True)
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = _fit_lr().backtest(
+                    metric=dm.mae,
+                    metric_kwargs={},
+                    series=[TS_UNIVARIATE, TS_MULTIVARIATE],
+                    forecast_horizon=1,
+                    reduction=np.mean,
+                    last_points_only=True,
+                    start=-2,
+                    retrain=True,
+                )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (2,)  # (n_series,)
 
         m = mlflow.get_run(run.info.run_id).data.metrics
-        assert m["backtest_mae"] == pytest.approx(2.0)
+        assert m["backtest_mae"] == pytest.approx(np.mean(ref))
 
     def test_log_backtest_metrics_component_count_mismatch_raises(
         self, mlflow_tracking
@@ -1722,7 +1762,7 @@ class TestMLflow:
         backtest_args = {
             "metric": dm.mae,
             "metric_kwargs": {"component_reduction": None},
-            "series": [self.ts_univariate, self.ts_multivariate],
+            "series": [TS_UNIVARIATE, TS_MULTIVARIATE],
             "forecast_horizon": 1,
             "reduction": np.mean,
             "last_points_only": True,
@@ -1803,234 +1843,219 @@ class TestMLflow:
 
         assert not mlflow.get_run(run.info.run_id).data.metrics
 
-    def test_log_backtest_metrics_aligns_windows_by_end_date(self, mlflow_tracking):
+    def test_log_backtest_metrics_aligns_windows_by_end_date(
+        self, autolog_context, mlflow_tracking
+    ):
         """A shorter series' window axis aligns from the end, not the start,
         so its last windows overlap the tail of a longer series. Steps and
         ``window_index`` are ``0 .. max_w - 1``. Calls _log_backtest_metrics
         directly with a fabricated result so the window counts per series
         are exact."""
-        backtest_args = {
-            "metric": dm.mae,
-            "metric_kwargs": {},
-            "series": [self.ts_univariate, self.ts_univariate],
-            "forecast_horizon": 1,
-            "reduction": None,
-            "last_points_only": False,
-        }
-        # series 0 has 5 windows; series 1 (shorter, later-starting) has 3
-        result = [np.array([1.0, 2.0, 3.0, 4.0, 5.0]), np.array([10.0, 20.0, 30.0])]
-
-        with mlflow.start_run() as run:
-            client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(
-                client,
-                run.info.run_id,
-                result,
-                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
-            )
-            client.flush(synchronous=True)
+        model = _fit_lr()
+        input_length = abs(min(model.lags["target"]))
+        n_windows = 2
+        series_two_windows = TS_UNIVARIATE[-(input_length + n_windows) :]
+        # series 0 has 2 windows; series 1 (shorter, later-starting) has 1
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = model.backtest(
+                    metric=dm.mae,
+                    metric_kwargs={},
+                    series=[series_two_windows, series_two_windows[1:]],
+                    forecast_horizon=1,
+                    reduction=None,
+                    last_points_only=False,
+                    start=-n_windows,
+                    retrain=False,
+                )
+        expected_shapes = [(n_windows,), (n_windows - 1,)]
+        for ref_i, shape in zip(ref, expected_shapes):
+            assert ref_i.shape == shape
 
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
         logged = {m.step: m.value for m in history}
-        assert logged == pytest.approx({0: 1.0, 1: 2.0, 2: 6.5, 3: 12.0, 4: 17.5})
+        assert logged == pytest.approx({
+            0: ref[0][0],
+            1: np.mean([ref[0][1], ref[1][0]]),
+        })
 
-        rows = self._read_per_series_table(run.info.run_id)
-        by_step = {(r["series_index"], r["step"]): r["value"] for r in rows}
-        assert by_step[(0, 0)] == pytest.approx(1.0)
-        assert by_step[(0, 4)] == pytest.approx(5.0)
-        assert by_step[(1, 2)] == pytest.approx(10.0)
-        assert by_step[(1, 4)] == pytest.approx(30.0)
-        assert (1, 0) not in by_step
-        assert (1, 1) not in by_step
-        for r in rows:
-            assert r["window_index"] == r["step"]
+        rows = _read_per_series_table(run.info.run_id)
+        for s_idx, shape in enumerate(expected_shapes):
+            w_size = shape[0]
+            for w_idx in range(w_size):
+                row = rows[s_idx * n_windows + w_idx]
+                window_index = w_idx + n_windows - w_size
+                assert row["key"] == "backtest_mae"
+                assert row["series_index"] == s_idx
+                assert row["step"] == window_index
+                assert row["window_index"] == window_index
+                assert row["value"] == pytest.approx(ref[s_idx][w_idx])
 
     def test_log_backtest_metrics_aligns_last_points_only_time_axis(
-        self, mlflow_tracking
+        self, autolog_context, mlflow_tracking
     ):
         """last_points_only stitches windows into one series scored per real
         timestep. Shorter series align from the end, same as the window-axis
         case, with steps ``0 .. t_max - 1`` rather than end-relative indexes.
         """
-        backtest_args = {
-            "metric": dm.ae,
-            "metric_kwargs": {},
-            "series": [self.ts_univariate, self.ts_univariate],
-            "forecast_horizon": 1,
-            "reduction": None,
-            "last_points_only": True,
-        }
-        # series 0 has 5 timesteps; series 1 (shorter, later-starting) has 3
-        result = [np.array([1.0, 2.0, 3.0, 4.0, 5.0]), np.array([10.0, 20.0, 30.0])]
+        model = _fit_lr()
+        input_length = abs(min(model.lags["target"]))
+        n_windows = 2
+        horizon = 3
+        series_two_windows = TS_UNIVARIATE[-(input_length + horizon + n_windows - 1) :]
+        # series 0 forecast has 2 timesteps; series 1 (shorter, later-starting) has 1
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = model.backtest(
+                    metric=dm.ae,
+                    series=[series_two_windows, series_two_windows[1:]],
+                    forecast_horizon=horizon,
+                    reduction=None,
+                    last_points_only=True,
+                    start=-(horizon + n_windows - 1),
+                    retrain=False,
+                )
 
-        with mlflow.start_run() as run:
-            client = MlflowAutologgingQueueingClient()
-            _log_backtest_metrics(
-                client,
-                run.info.run_id,
-                result,
-                {**BT_REQUIRED_DEFAUTLS, **backtest_args},
-            )
-            client.flush(synchronous=True)
+        ref = [np.atleast_1d(ref_i) for ref_i in ref]
+        expected_shapes = [(n_windows,), (n_windows - 1,)]
+        for ref_i, shape in zip(ref, expected_shapes):
+            assert ref_i.shape == shape
 
         history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
         logged = {m.step: m.value for m in history}
-        assert logged == pytest.approx({0: 1.0, 1: 2.0, 2: 6.5, 3: 12.0, 4: 17.5})
+        assert logged == pytest.approx({
+            0: ref[0][0],
+            1: np.mean([ref[0][1], ref[1][0]]),
+        })
 
-        rows = self._read_per_series_table(run.info.run_id)
-        by_step = {(r["series_index"], r["step"]): r["value"] for r in rows}
-        assert by_step[(0, 0)] == pytest.approx(1.0)
-        assert by_step[(0, 4)] == pytest.approx(5.0)
-        assert by_step[(1, 2)] == pytest.approx(10.0)
-        assert by_step[(1, 4)] == pytest.approx(30.0)
-        assert (1, 0) not in by_step
-        assert (1, 1) not in by_step
-        assert all(pd.isna(r["window_index"]) for r in rows)
-
-    @staticmethod
-    def _read_per_series_table(run_id):
-        """Load the run's consolidated per-series metric table into row dicts."""
-        df = mlflow.load_table(
-            artifact_file="metrics_per_series.json", run_ids=[run_id]
-        )
-        return df.to_dict("records")
-
-    def _fit_lr(self, series=None):
-        """Fit and return a fresh LinearRegressionModel (no active run)."""
-        model = LinearRegressionModel(lags=4)
-        model.fit(series if series is not None else self.ts_univariate)
-        return model
-
-    def _fit_qlr(self, series=None):
-        """Fit and return a fresh quantile LinearRegressionModel (no active run)."""
-        model = LinearRegressionModel(
-            lags=4, likelihood="quantile", quantiles=[0.1, 0.5, 0.9]
-        )
-        model.fit(series if series is not None else self.ts_univariate)
-        return model
+        rows = _read_per_series_table(run.info.run_id)
+        for s_idx, shape in enumerate(expected_shapes):
+            w_size = shape[0]
+            for w_idx in range(w_size):
+                row = rows[s_idx * n_windows + w_idx]
+                window_index = w_idx + n_windows - w_size
+                assert row["key"] == "backtest_ae"
+                assert row["series_index"] == s_idx
+                assert row["step"] == window_index
+                assert np.isnan(row["window_index"])
+                assert row["value"] == pytest.approx(ref[s_idx][w_idx])
 
 
-@pytest.mark.parametrize(
-    "metric_name, metric_kwargs, expected",
-    [
-        ("mae", {}, dict(has_time_axis=False, has_comp_axis=False, axis_size=1)),
-        ("ae", {}, dict(has_time_axis=True, has_comp_axis=False, axis_size=1)),
-        ("mae", {"component_reduction": None}, dict(has_comp_axis=True)),
-    ],
-)
-def test_infer_metric_axes_reductions(metric_name, metric_kwargs, expected):
-    has_time_axis, has_comp_axis, axis_labels = _infer_metric_axes(
-        getattr(dm, metric_name), metric_kwargs
-    )
-    actual = {
-        "has_time_axis": has_time_axis,
-        "has_comp_axis": has_comp_axis,
-        "axis_size": len(axis_labels),
-    }
-    for attr, value in expected.items():
-        assert actual[attr] == value
-
-
-def test_infer_metric_axes_quantiles():
-    _, _, axis_labels = _infer_metric_axes(dm.mql, {"q": [0.1, 0.5, 0.9]})
-    assert axis_labels == ["_q0.100", "_q0.500", "_q0.900"]
-
-
-def test_infer_metric_axes_quantile_interval():
-    has_time, _, axis_labels = _infer_metric_axes(dm.iw, {"q_interval": (0.1, 0.9)})
-    assert axis_labels == ["_qi0.800"]
-    assert has_time is True
-
-
-def test_infer_metric_axes_unknown_labels_raises():
-    """label_reduction=None with no explicit labels cannot determine the number
-    of output labels ahead of time, so this raises rather than falling back."""
-    with pytest.raises(ValueError, match="requires explicit `labels`"):
-        _infer_metric_axes(dm.f1, {"label_reduction": None})
-
-
-def test_build_metric_keys_components_and_quantiles():
-    """Shared key builder expands components x quantile suffixes per metric."""
-    metric_axes = [
-        (False, True, ["_q0.100", "_q0.900"]),
-        (False, True, ["_label0", "_label1"]),
-    ]
-    metric_keys = _build_metric_keys(
-        ["mae", "f1"],
-        ["temp", "hum"],
-        has_comp_axis=True,
-        metric_axes=metric_axes,
-        prefix="backtest_",
-    )
-    c_size = len(metric_keys[0])
-    assert c_size == 4
-    assert metric_keys == [
+class TestAutoLogMetricHelperFunctions:
+    @pytest.mark.parametrize(
+        "metric_name, metric_kwargs, expected",
         [
-            "backtest_mae_temp_q0.100",
-            "backtest_mae_temp_q0.900",
-            "backtest_mae_hum_q0.100",
-            "backtest_mae_hum_q0.900",
+            ("mae", {}, dict(has_time_axis=False, has_comp_axis=False, axis_size=1)),
+            ("ae", {}, dict(has_time_axis=True, has_comp_axis=False, axis_size=1)),
+            ("mae", {"component_reduction": None}, dict(has_comp_axis=True)),
         ],
-        [
-            "backtest_f1_temp_label0",
-            "backtest_f1_temp_label1",
-            "backtest_f1_hum_label0",
-            "backtest_f1_hum_label1",
-        ],
-    ]
-
-
-def test_build_metric_keys_no_components_no_prefix():
-    """Without components, each metric gets one key per axis label."""
-    metric_axes = [(False, False, ["_q0.500"])]
-    metric_keys = _build_metric_keys(
-        ["mql"],
-        ["ignored"],
-        has_comp_axis=False,
-        metric_axes=metric_axes,
     )
-    c_size = len(metric_keys[0])
-    assert c_size == 1
-    assert metric_keys == [["mql_q0.500"]]
-
-
-def test_flush_logged_metrics_aggregates_and_writes_table(mlflow_tracking):
-    """Cells are aggregated with agg_func; supplied table rows are persisted."""
-    agg = {
-        ("mae", 0): [1.0, 3.0],
-        ("mae", 1): [10.0, 30.0],
-    }
-    rows = [
-        {"key": "mae", "series_index": 0, "step": 0, "value": 1.0},
-        {"key": "mae", "series_index": 1, "step": 0, "value": 3.0},
-        {"key": "mae", "series_index": 0, "step": 1, "value": 10.0},
-        {"key": "mae", "series_index": 1, "step": 1, "value": 30.0},
-    ]
-    with mlflow.start_run() as run:
-        client = MlflowAutologgingQueueingClient()
-        _flush_logged_metrics(
-            client, run.info.run_id, agg, agg_func=np.mean, table_rows=rows
+    def test_infer_metric_axes_reductions(metric_name, metric_kwargs, expected):
+        has_time_axis, has_comp_axis, axis_labels = _infer_metric_axes(
+            getattr(dm, metric_name), metric_kwargs
         )
-        client.flush(synchronous=True)
+        actual = {
+            "has_time_axis": has_time_axis,
+            "has_comp_axis": has_comp_axis,
+            "axis_size": len(axis_labels),
+        }
+        for attr, value in expected.items():
+            assert actual[attr] == value
 
-    history0 = mlflow_tracking.get_metric_history(run.info.run_id, "mae")
-    logged = {m.step: m.value for m in history0}
-    assert logged[0] == pytest.approx(2.0)
-    assert logged[1] == pytest.approx(20.0)
-    table = mlflow.load_table(
-        artifact_file="metrics_per_series.json", run_ids=[run.info.run_id]
-    )
-    assert len(table) == 4
+    def test_infer_metric_axes_quantiles():
+        _, _, axis_labels = _infer_metric_axes(dm.mql, {"q": [0.1, 0.5, 0.9]})
+        assert axis_labels == ["_q0.100", "_q0.500", "_q0.900"]
 
+    def test_infer_metric_axes_quantile_interval():
+        has_time, _, axis_labels = _infer_metric_axes(dm.iw, {"q_interval": (0.1, 0.9)})
+        assert axis_labels == ["_qi0.800"]
+        assert has_time is True
 
-def test_flush_logged_metrics_skips_table_without_rows(mlflow_tracking):
-    """Omitting table rows logs the aggregate only."""
-    agg = {("mae", 0): [1.5]}
-    with mlflow.start_run() as run:
-        client = MlflowAutologgingQueueingClient()
-        _flush_logged_metrics(client, run.info.run_id, agg, agg_func=np.mean)
-        client.flush(synchronous=True)
+    def test_infer_metric_axes_unknown_labels_raises():
+        """label_reduction=None with no explicit labels cannot determine the number
+        of output labels ahead of time, so this raises rather than falling back."""
+        with pytest.raises(ValueError, match="requires explicit `labels`"):
+            _infer_metric_axes(dm.f1, {"label_reduction": None})
 
-    assert mlflow.get_run(run.info.run_id).data.metrics["mae"] == pytest.approx(1.5)
-    artifacts = mlflow_tracking.list_artifacts(run.info.run_id)
-    assert not any(a.path == "metrics_per_series.json" for a in artifacts)
+    def test_build_metric_keys_components_and_quantiles():
+        """Shared key builder expands components x quantile suffixes per metric."""
+        metric_axes = [
+            (False, True, ["_q0.100", "_q0.900"]),
+            (False, True, ["_label0", "_label1"]),
+        ]
+        metric_keys = _build_metric_keys(
+            ["mae", "f1"],
+            ["temp", "hum"],
+            has_comp_axis=True,
+            metric_axes=metric_axes,
+            prefix="backtest_",
+        )
+        c_size = len(metric_keys[0])
+        assert c_size == 4
+        assert metric_keys == [
+            [
+                "backtest_mae_temp_q0.100",
+                "backtest_mae_temp_q0.900",
+                "backtest_mae_hum_q0.100",
+                "backtest_mae_hum_q0.900",
+            ],
+            [
+                "backtest_f1_temp_label0",
+                "backtest_f1_temp_label1",
+                "backtest_f1_hum_label0",
+                "backtest_f1_hum_label1",
+            ],
+        ]
+
+    def test_build_metric_keys_no_components_no_prefix():
+        """Without components, each metric gets one key per axis label."""
+        metric_axes = [(False, False, ["_q0.500"])]
+        metric_keys = _build_metric_keys(
+            ["mql"],
+            ["ignored"],
+            has_comp_axis=False,
+            metric_axes=metric_axes,
+        )
+        c_size = len(metric_keys[0])
+        assert c_size == 1
+        assert metric_keys == [["mql_q0.500"]]
+
+    def test_flush_logged_metrics_aggregates_and_writes_table(mlflow_tracking):
+        """Cells are aggregated with agg_func; supplied table rows are persisted."""
+        agg = {
+            ("mae", 0): [1.0, 3.0],
+            ("mae", 1): [10.0, 30.0],
+        }
+        rows = [
+            {"key": "mae", "series_index": 0, "step": 0, "value": 1.0},
+            {"key": "mae", "series_index": 1, "step": 0, "value": 3.0},
+            {"key": "mae", "series_index": 0, "step": 1, "value": 10.0},
+            {"key": "mae", "series_index": 1, "step": 1, "value": 30.0},
+        ]
+        with mlflow.start_run() as run:
+            client = MlflowAutologgingQueueingClient()
+            _flush_logged_metrics(
+                client, run.info.run_id, agg, agg_func=np.mean, table_rows=rows
+            )
+            client.flush(synchronous=True)
+
+        history0 = mlflow_tracking.get_metric_history(run.info.run_id, "mae")
+        logged = {m.step: m.value for m in history0}
+        assert logged[0] == pytest.approx(2.0)
+        assert logged[1] == pytest.approx(20.0)
+        table = mlflow.load_table(
+            artifact_file="metrics_per_series.json", run_ids=[run.info.run_id]
+        )
+        assert len(table) == 4
+
+    def test_flush_logged_metrics_skips_table_without_rows(mlflow_tracking):
+        """Omitting table rows logs the aggregate only."""
+        agg = {("mae", 0): [1.5]}
+        with mlflow.start_run() as run:
+            client = MlflowAutologgingQueueingClient()
+            _flush_logged_metrics(client, run.info.run_id, agg, agg_func=np.mean)
+            client.flush(synchronous=True)
+
+        assert mlflow.get_run(run.info.run_id).data.metrics["mae"] == pytest.approx(1.5)
+        artifacts = mlflow_tracking.list_artifacts(run.info.run_id)
+        assert not any(a.path == "metrics_per_series.json" for a in artifacts)
