@@ -1,6 +1,8 @@
 import copy
 import logging
 import os
+import uuid
+from contextlib import contextmanager
 
 import numpy as np
 import pandas as pd
@@ -67,11 +69,41 @@ TS_BINARY = tg.constant_timeseries(value=0.0, length=50).with_values(
 )
 
 
+@pytest.fixture(scope="module")
+def _mlflow_store(tmp_path_factory):
+    """Shared MLflow backend for the whole module (one SQLite DB)."""
+    store_dir = tmp_path_factory.mktemp("mlflow")
+    mlflow.set_tracking_uri(f"sqlite:///{store_dir / 'mlflow.db'}")
+    return store_dir
+
+
 @pytest.fixture
-def mlflow_tracking(tmpdir_fn):
-    """Set up MLflow tracking with a temporary database."""
-    mlflow.set_tracking_uri(f"sqlite:///{tmpdir_fn}/mlflow.db")
-    return mlflow.tracking.MlflowClient()
+def mlflow_tracking(_mlflow_store, request):
+    """Isolated MLflow experiment per test on the shared module store."""
+    exp_name = f"darts_mlflow_{request.node.name}"
+    artifact_root = _mlflow_store / f"artifacts_{uuid.uuid4().hex}"
+    artifact_root.mkdir(parents=True, exist_ok=True)
+
+    client = mlflow.tracking.MlflowClient()
+    exp_id = client.create_experiment(
+        exp_name,
+        artifact_location=str(artifact_root),
+    )
+    mlflow.set_experiment(experiment_id=exp_id)
+
+    autolog(disable=True)
+    yield client
+    autolog(disable=True)
+
+
+@contextmanager
+def _autolog_context(**kwargs):
+    autolog(disable=True)
+    autolog(**kwargs)
+    try:
+        yield
+    finally:
+        autolog(disable=True)
 
 
 @pytest.fixture
@@ -80,19 +112,8 @@ def autolog_context():
 
     Usage:
         with autolog_context():            # default autolog
-        with autolog_context(log_training_metrics=True):   # custom kwargs
+        with autolog_context(log_models=True):   # custom kwargs
     """
-    from contextlib import contextmanager
-
-    @contextmanager
-    def _autolog_context(**kwargs):
-        autolog(disable=True)  # clean state
-        autolog(**kwargs)  # enable with custom kwargs
-        try:
-            yield
-        finally:
-            autolog(disable=True)  # clean up
-
     return _autolog_context
 
 
@@ -165,60 +186,62 @@ def _read_per_series_table(run_id):
 
 
 def _fit_lr(series=None):
-    """Fit and return a fresh LinearRegressionModel (no active run)."""
+    """Fit and return a LinearRegressionModel (no active run)."""
+    series = TS_UNIVARIATE if series is None else series
     model = LinearRegressionModel(lags=1)
-    model.fit(series if series is not None else TS_UNIVARIATE)
+    model.fit(series)
     return model
 
 
 def _fit_qlr(series=None):
-    """Fit and return a fresh quantile LinearRegressionModel (no active run)."""
+    """Fit and return a quantile LinearRegressionModel (no active run)."""
+    series = TS_UNIVARIATE if series is None else series
     model = LinearRegressionModel(
         lags=1, likelihood="quantile", quantiles=[0.1, 0.5, 0.9]
     )
-    model.fit(series if series is not None else TS_UNIVARIATE)
+    model.fit(series)
     return model
 
 
 class TestMLflow:
-    def test_save_load_statistical_model(self, tmpdir_fn):
+    def test_save_load_statistical_model(self, tmp_path):
         """Test save/load round-trip for statistical model"""
         model = ExponentialSmoothing()
         model.fit(TS_UNIVARIATE)
 
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
 
-        assert_mlflow_artifacts_exist(model_path, is_torch=False)
+        assert_mlflow_artifacts_exist(str(model_path), is_torch=False)
 
         loaded_model = load_model(f"file://{model_path}")
         assert_predictions_equal(model, loaded_model, n=5, is_global=False)
 
-    def test_save_load_regression_model(self, tmpdir_fn):
+    def test_save_load_regression_model(self, tmp_path):
         """Test save/load round-trip for regression model"""
         model = LinearRegressionModel(lags=5)
         model.fit(TS_UNIVARIATE)
 
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
 
-        assert_mlflow_artifacts_exist(model_path, is_torch=False)
+        assert_mlflow_artifacts_exist(str(model_path), is_torch=False)
 
         loaded_model = load_model(f"file://{model_path}")
         assert_predictions_equal(model, loaded_model, n=3, series=TS_UNIVARIATE)
 
     @pytest.mark.skipif(not TORCH_AVAILABLE, reason="requires torch")
-    def test_save_load_torch_model(self, tmpdir_fn):
+    def test_save_load_torch_model(self, tmp_path):
         """Test save/load round-trip for torch model"""
         model = NBEATSModel(
             input_chunk_length=4, output_chunk_length=2, n_epochs=1, **tfm_kwargs_dev
         )
         model.fit(TS_UNIVARIATE)
 
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
 
-        assert_mlflow_artifacts_exist(model_path, is_torch=True)
+        assert_mlflow_artifacts_exist(str(model_path), is_torch=True)
 
         # save(clean=True) strips pl_trainer_kwargs; explicitly restore accelerator
         # so Lightning doesn't default to MPS on Github macOS runner
@@ -663,17 +686,17 @@ class TestMLflow:
         with pytest.raises(Exception):
             load_model("file:///nonexistent/path/to/model")
 
-    def test_load_corrupted_mlmodel_fails(self, tmpdir_fn):
+    def test_load_corrupted_mlmodel_fails(self, tmp_path):
         """Test that loading with corrupted MLmodel file fails"""
         # save a valid model
         model = LinearRegressionModel(lags=5)
         model.fit(TS_UNIVARIATE)
 
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
 
         # corrupt the MLmodel file
-        mlmodel_path = os.path.join(model_path, "MLmodel")
+        mlmodel_path = model_path / "MLmodel"
         with open(mlmodel_path, "w") as f:
             f.write("corrupted content that is not valid YAML {[[")
 
@@ -681,17 +704,17 @@ class TestMLflow:
         with pytest.raises(Exception):
             load_model(f"file://{model_path}")
 
-    def test_load_missing_model_file_fails(self, tmpdir_fn):
+    def test_load_missing_model_file_fails(self, tmp_path):
         """Test that loading with missing model data file fails"""
         # save a valid model
         model = LinearRegressionModel(lags=5)
         model.fit(TS_UNIVARIATE)
 
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
 
         # remove the model data file
-        model_data_path = os.path.join(model_path, "model.pkl")
+        model_data_path = model_path / "model.pkl"
         os.remove(model_data_path)
 
         # loading should fail
@@ -705,7 +728,7 @@ class TestMLflow:
             (LinearRegressionModel, {"lags": 5}),
         ],
     )
-    def test_save_load_multiple_models(self, tmpdir_fn, model_cls, fit_kwargs):
+    def test_save_load_multiple_models(self, tmp_path, model_cls, fit_kwargs):
         """Test save/load for multiple model types"""
         if fit_kwargs:
             model = model_cls(**fit_kwargs)
@@ -714,8 +737,8 @@ class TestMLflow:
 
         model.fit(TS_UNIVARIATE)
 
-        model_path = os.path.join(tmpdir_fn, "test_model")
-        save_model(model, model_path)
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
         loaded = load_model(f"file://{model_path}")
 
         # Only pass series for global models (LinearRegressionModel)
@@ -732,13 +755,13 @@ class TestMLflow:
             (TS_WITH_STATIC, "static_covariates"),
         ],
     )
-    def test_save_load_with_special_series(self, tmpdir_fn, series, series_name):
+    def test_save_load_with_special_series(self, tmp_path, series, series_name):
         """Test save/load with multivariate and static covariate series"""
         model = LinearRegressionModel(lags=5)
         model.fit(series)
 
-        model_path = os.path.join(tmpdir_fn, f"test_model_{series_name}")
-        save_model(model, model_path)
+        model_path = tmp_path / f"test_model_{series_name}"
+        save_model(model, str(model_path))
 
         loaded_model = load_model(f"file://{model_path}")
 
@@ -1950,7 +1973,7 @@ class TestAutoLogMetricHelperFunctions:
             ("mae", {"component_reduction": None}, dict(has_comp_axis=True)),
         ],
     )
-    def test_infer_metric_axes_reductions(metric_name, metric_kwargs, expected):
+    def test_infer_metric_axes_reductions(self, metric_name, metric_kwargs, expected):
         has_time_axis, has_comp_axis, axis_labels = _infer_metric_axes(
             getattr(dm, metric_name), metric_kwargs
         )
@@ -1962,22 +1985,22 @@ class TestAutoLogMetricHelperFunctions:
         for attr, value in expected.items():
             assert actual[attr] == value
 
-    def test_infer_metric_axes_quantiles():
+    def test_infer_metric_axes_quantiles(self):
         _, _, axis_labels = _infer_metric_axes(dm.mql, {"q": [0.1, 0.5, 0.9]})
         assert axis_labels == ["_q0.100", "_q0.500", "_q0.900"]
 
-    def test_infer_metric_axes_quantile_interval():
+    def test_infer_metric_axes_quantile_interval(self):
         has_time, _, axis_labels = _infer_metric_axes(dm.iw, {"q_interval": (0.1, 0.9)})
         assert axis_labels == ["_qi0.800"]
         assert has_time is True
 
-    def test_infer_metric_axes_unknown_labels_raises():
+    def test_infer_metric_axes_unknown_labels_raises(self):
         """label_reduction=None with no explicit labels cannot determine the number
         of output labels ahead of time, so this raises rather than falling back."""
         with pytest.raises(ValueError, match="requires explicit `labels`"):
             _infer_metric_axes(dm.f1, {"label_reduction": None})
 
-    def test_build_metric_keys_components_and_quantiles():
+    def test_build_metric_keys_components_and_quantiles(self):
         """Shared key builder expands components x quantile suffixes per metric."""
         metric_axes = [
             (False, True, ["_q0.100", "_q0.900"]),
@@ -2007,7 +2030,7 @@ class TestAutoLogMetricHelperFunctions:
             ],
         ]
 
-    def test_build_metric_keys_no_components_no_prefix():
+    def test_build_metric_keys_no_components_no_prefix(self):
         """Without components, each metric gets one key per axis label."""
         metric_axes = [(False, False, ["_q0.500"])]
         metric_keys = _build_metric_keys(
@@ -2020,7 +2043,7 @@ class TestAutoLogMetricHelperFunctions:
         assert c_size == 1
         assert metric_keys == [["mql_q0.500"]]
 
-    def test_flush_logged_metrics_aggregates_and_writes_table(mlflow_tracking):
+    def test_flush_logged_metrics_aggregates_and_writes_table(self, mlflow_tracking):
         """Cells are aggregated with agg_func; supplied table rows are persisted."""
         agg = {
             ("mae", 0): [1.0, 3.0],
@@ -2048,7 +2071,7 @@ class TestAutoLogMetricHelperFunctions:
         )
         assert len(table) == 4
 
-    def test_flush_logged_metrics_skips_table_without_rows(mlflow_tracking):
+    def test_flush_logged_metrics_skips_table_without_rows(self, mlflow_tracking):
         """Omitting table rows logs the aggregate only."""
         agg = {("mae", 0): [1.5]}
         with mlflow.start_run() as run:
