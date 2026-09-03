@@ -1,4 +1,5 @@
 import copy
+import itertools
 import logging
 import os
 import uuid
@@ -1963,6 +1964,163 @@ class TestAutoLogBacktestMetrics:
                 assert np.isnan(row["window_index"])
                 assert row["value"] == pytest.approx(ref[s_idx][w_idx])
 
+    def test_log_backtest_metrics_aligns_windows_by_start(
+        self, autolog_context, mlflow_tracking
+    ):
+        """A shorter series' window axis aligns from the start when
+        ``series_align='start'``, so its first windows overlap the head of a
+        longer series."""
+        model = _fit_lr()
+        input_length = abs(min(model.lags["target"]))
+        n_windows = 2
+        series_two_windows = TS_UNIVARIATE[-(input_length + n_windows) :]
+        with autolog_context(log_metrics=True, series_align="start"):
+            with mlflow.start_run() as run:
+                ref = model.backtest(
+                    metric=dm.mae,
+                    metric_kwargs={},
+                    series=[series_two_windows, series_two_windows[1:]],
+                    forecast_horizon=1,
+                    reduction=None,
+                    last_points_only=False,
+                    start=-n_windows,
+                    retrain=False,
+                )
+        expected_shapes = [(n_windows,), (n_windows - 1,)]
+        for ref_i, shape in zip(ref, expected_shapes):
+            assert ref_i.shape == shape
+
+        history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
+        logged = {m.step: m.value for m in history}
+        assert logged == pytest.approx({
+            0: np.mean([ref[0][0], ref[1][0]]),
+            1: ref[0][1],
+        })
+
+        rows = _read_per_series_table(run.info.run_id)
+        for s_idx, shape in enumerate(expected_shapes):
+            w_size = shape[0]
+            for w_idx in range(w_size):
+                row = rows[s_idx * n_windows + w_idx]
+                assert row["key"] == "backtest_mae"
+                assert row["series_index"] == s_idx
+                assert row["step"] == w_idx
+                assert row["window_index"] == w_idx
+                assert row["value"] == pytest.approx(ref[s_idx][w_idx])
+
+    def test_log_backtest_metrics_aligns_last_points_only_by_start(
+        self, autolog_context, mlflow_tracking
+    ):
+        """last_points_only with ``series_align='start'`` aligns shorter series
+        at early timesteps."""
+        model = _fit_lr()
+        input_length = abs(min(model.lags["target"]))
+        n_windows = 2
+        horizon = 3
+        series_two_windows = TS_UNIVARIATE[-(input_length + horizon + n_windows - 1) :]
+        with autolog_context(log_metrics=True, series_align="start"):
+            with mlflow.start_run() as run:
+                ref = model.backtest(
+                    metric=dm.ae,
+                    series=[series_two_windows, series_two_windows[1:]],
+                    forecast_horizon=horizon,
+                    reduction=None,
+                    last_points_only=True,
+                    start=-(horizon + n_windows - 1),
+                    retrain=False,
+                )
+
+        ref = [np.atleast_1d(ref_i) for ref_i in ref]
+        expected_shapes = [(n_windows,), (n_windows - 1,)]
+        for ref_i, shape in zip(ref, expected_shapes):
+            assert ref_i.shape == shape
+
+        history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
+        logged = {m.step: m.value for m in history}
+        assert logged == pytest.approx({
+            0: np.mean([ref[0][0], ref[1][0]]),
+            1: ref[0][1],
+        })
+
+        rows = _read_per_series_table(run.info.run_id)
+        for s_idx, shape in enumerate(expected_shapes):
+            w_size = shape[0]
+            for w_idx in range(w_size):
+                row = rows[s_idx * n_windows + w_idx]
+                assert row["key"] == "backtest_ae"
+                assert row["series_index"] == s_idx
+                assert row["step"] == w_idx
+                assert np.isnan(row["window_index"])
+                assert row["value"] == pytest.approx(ref[s_idx][w_idx])
+
+    @pytest.mark.parametrize("config", list(itertools.product([1, 3], [True, False])))
+    def test_autolog_backtest_log_aggregate_scalar(
+        self, autolog_context, mlflow_tracking, config
+    ):
+        """log_backtest_aggregate logs backtest_agg_* equal to scalar backtest_*."""
+        horizon, lpo = config
+        n_windows = 2
+        with autolog_context(log_metrics=True, log_backtest_aggregate=True):
+            with mlflow.start_run() as run:
+                ref = _fit_lr().backtest(
+                    TS_UNIVARIATE,
+                    metric=dm.mae,
+                    retrain=False,
+                    start=-(horizon + n_windows - 1),
+                    last_points_only=lpo,
+                    forecast_horizon=horizon,
+                    reduction=None,
+                )
+        ref = np.nanmean(ref)
+        m = mlflow.get_run(run.info.run_id).data.metrics
+        assert m["backtest_agg_mae"] == pytest.approx(ref)
+
+    @pytest.mark.parametrize("horizon", [1, 3])
+    def test_autolog_backtest_log_aggregate_stepped(
+        self, autolog_context, mlflow_tracking, horizon
+    ):
+        """log_backtest_aggregate collapses stepped backtest metrics via agg_func."""
+        with autolog_context(
+            log_metrics=True, log_backtest_aggregate=True, agg_func=np.nanmean
+        ):
+            with mlflow.start_run() as run:
+                _fit_lr().backtest(
+                    TS_UNIVARIATE,
+                    metric=dm.ae,
+                    retrain=False,
+                    start=-(horizon + 1),
+                    last_points_only=False,
+                    forecast_horizon=horizon,
+                    reduction=np.nanmean,
+                )
+        history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_ae")
+        stepped_values = [m.value for m in sorted(history, key=lambda m: m.step)]
+        m = mlflow.get_run(run.info.run_id).data.metrics
+        assert m["backtest_agg_ae"] == pytest.approx(np.nanmean(stepped_values))
+
+    @pytest.mark.parametrize("horizon", [1, 3])
+    def test_autolog_backtest_log_aggregate_custom_agg_func(
+        self, autolog_context, mlflow_tracking, horizon
+    ):
+        """log_backtest_aggregate uses autolog's agg_func over all logged steps."""
+        series = TS_UNIVARIATE
+        series = [series * 0.9, series, series * 1.1]
+        with autolog_context(
+            log_metrics=True, log_backtest_aggregate=True, agg_func=np.median
+        ):
+            with mlflow.start_run() as run:
+                ref = _fit_lr(series[0]).backtest(
+                    metric=dm.mae,
+                    series=series,
+                    last_points_only=True,
+                    start=-(horizon + 1),
+                    forecast_horizon=horizon,
+                )
+        ref = np.atleast_1d(ref)
+        assert ref.shape == (len(series),)
+        m = mlflow.get_run(run.info.run_id).data.metrics
+        assert m["backtest_agg_mae"] == pytest.approx(np.median(ref))
+
 
 class TestAutoLogMetricHelperFunctions:
     @pytest.mark.parametrize(
@@ -2082,3 +2240,27 @@ class TestAutoLogMetricHelperFunctions:
         assert mlflow.get_run(run.info.run_id).data.metrics["mae"] == pytest.approx(1.5)
         artifacts = mlflow_tracking.list_artifacts(run.info.run_id)
         assert not any(a.path == "metrics_per_series.json" for a in artifacts)
+
+    def test_flush_logged_metrics_backtest_aggregate(self, mlflow_tracking):
+        """log_backtest_aggregate logs backtest_agg_* as agg_func over all steps."""
+        agg = {
+            ("backtest_mae", 0): [1.0, 3.0],
+            ("backtest_mae", 1): [10.0, 30.0],
+        }
+        with mlflow.start_run() as run:
+            client = MlflowAutologgingQueueingClient()
+            _flush_logged_metrics(
+                client,
+                run.info.run_id,
+                agg,
+                agg_func=np.mean,
+                log_backtest_aggregate=True,
+            )
+            client.flush(synchronous=True)
+
+        m = mlflow.get_run(run.info.run_id).data.metrics
+        history = mlflow_tracking.get_metric_history(run.info.run_id, "backtest_mae")
+        logged = {h.step: h.value for h in history}
+        assert logged[0] == pytest.approx(2.0)
+        assert logged[1] == pytest.approx(20.0)
+        assert m["backtest_agg_mae"] == pytest.approx(np.mean([2.0, 20.0]))

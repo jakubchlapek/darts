@@ -161,6 +161,19 @@ an active MLflow run (e.g. within ``with mlflow.start_run():``):
           horizon aggregated over all windows. Steps represent the steps in
           the forecast horizon (0, 1, ..., horizon - 1).
 
+    - Multi-series alignment (``series_align`` autolog option):
+
+      - ``"end"`` (default): shorter series skip early steps/windows so their
+        last points overlap the tail of longer series.
+      - ``"start"``: shorter series contribute at early steps/windows; longer
+        series have fewer contributing series at tail steps.
+
+    - Backtest aggregate (``log_backtest_aggregate`` autolog option):
+
+      - When enabled, logs an additional scalar per backtest metric key under
+        ``backtest_agg_{metric_key}`` (e.g. ``backtest_agg_mae``), computed
+        as ``agg_func`` over all logged steps for that key.
+
     When components are preserved (``component_reduction=None``), all
     series scored together must have the same number of components; names
     are taken from the first series.
@@ -173,7 +186,7 @@ import threading
 from collections.abc import Callable
 from operator import itemgetter
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from darts.logging import raise_log
 from darts.typing import TimeSeriesLike
@@ -486,6 +499,8 @@ def autolog(
     log_metrics: bool = True,
     log_torch_metrics: bool = True,
     agg_func: Callable = np.nanmean,
+    series_align: Literal["start", "end"] = "end",
+    log_backtest_aggregate: bool = False,
     disable: bool = False,
     silent: bool = False,
 ) -> None:
@@ -514,7 +529,17 @@ def autolog(
         Function used to aggregate a metric's per-series values into the
         single value logged for a list of series (e.g. ``np.nanmean``, the
         default, or ``np.median``). Called as ``agg_func(values)`` on a list
-        of floats.
+        of floats. Also used when ``log_backtest_aggregate=True`` to collapse
+        all logged steps of a backtest metric into a single scalar.
+    series_align
+        How to align shorter series when multiple series differ in window or
+        time length. ``"end"`` (default) aligns from the end so shorter series
+        skip early steps/windows; ``"start"`` aligns from the start so shorter
+        series contribute at early steps/windows.
+    log_backtest_aggregate
+        If ``True``, log an additional scalar per backtest metric key under
+        ``backtest_agg_{metric_key}`` (e.g. ``backtest_agg_mae``), computed as
+        ``agg_func`` over all logged steps for that key. Defaults to ``False``.
     disable
         If ``True``, restore the original ``fit()`` methods and stop
         autologging.
@@ -522,6 +547,13 @@ def autolog(
         If ``True`` (default ``False``), suppress all event logging and warnings from
         MLflow during autologging.
     """
+    if series_align not in ("start", "end"):
+        raise_log(
+            ValueError(
+                f"`series_align` must be 'start' or 'end', got {series_align!r}."
+            )
+        )
+
     # Enable/disable mlflow.pytorch.autolog for per-epoch metrics on torch models.
     # This must happen outside the @autologging_integration-decorated _autolog()
     # because that decorator short-circuits _autolog()'s body entirely when
@@ -563,6 +595,8 @@ def autolog(
         log_params=log_params,
         log_metrics=log_metrics,
         agg_func=agg_func,
+        series_align=series_align,
+        log_backtest_aggregate=log_backtest_aggregate,
         disable=disable,
         silent=silent,
     )
@@ -596,6 +630,8 @@ def _autolog(
     log_params: bool = True,
     log_metrics: bool = True,
     agg_func: Callable = np.nanmean,
+    series_align: Literal["start", "end"] = "end",
+    log_backtest_aggregate: bool = False,
     disable: bool = False,
     silent: bool = False,
 ) -> None:
@@ -761,6 +797,8 @@ def _autolog(
             result=result,
             backtest_kwargs=backtest_kwargs,
             agg_func=agg_func,
+            series_align=series_align,
+            log_backtest_aggregate=log_backtest_aggregate,
         )
         autologging_client.flush(synchronous=False).await_completion()
         return result
@@ -861,6 +899,9 @@ def _mlflow_metric_callback(func, result, args, kwargs) -> None:
     agg_func = get_autologging_config(
         flavor_name=FLAVOR_NAME, config_key="agg_func", default_value=np.nanmean
     )
+    series_align = get_autologging_config(
+        flavor_name=FLAVOR_NAME, config_key="series_align", default_value="end"
+    )
 
     autologging_client = MlflowAutologgingQueueingClient()
     _log_metric_results(
@@ -870,6 +911,7 @@ def _mlflow_metric_callback(func, result, args, kwargs) -> None:
         metrics=func,
         metric_kwargs=metric_kwargs,
         agg_func=agg_func,
+        series_align=series_align,
     )
     autologging_client.flush(synchronous=False).await_completion()
 
@@ -1188,6 +1230,8 @@ def _log_backtest_metrics(
     result,
     backtest_kwargs: dict,
     agg_func: Callable = np.nanmean,
+    series_align: Literal["start", "end"] = "end",
+    log_backtest_aggregate: bool = False,
 ) -> None:
     """Log backtest metric result(s) to MLflow.
 
@@ -1201,6 +1245,8 @@ def _log_backtest_metrics(
         metrics=backtest_kwargs["metric"],
         metric_kwargs=backtest_kwargs["metric_kwargs"] or dict(),
         agg_func=agg_func,
+        series_align=series_align,
+        log_backtest_aggregate=log_backtest_aggregate,
         backtest_kwargs=backtest_kwargs,
     )
 
@@ -1213,6 +1259,8 @@ def _log_metric_results(
     metric_kwargs: dict[str, Any] | list[dict[str, Any]],
     backtest_kwargs: dict[str, Any] | None = None,
     agg_func: Callable = np.nanmean,
+    series_align: Literal["start", "end"] = "end",
+    log_backtest_aggregate: bool = False,
 ) -> None:
     """Log backtest or standalone metric result(s) to MLflow.
 
@@ -1286,15 +1334,17 @@ def _log_metric_results(
       forecast horizon (``0 .. T-1``). When both time and window axes are
       present (backtest, no reduction, not ``last_points_only``), each step
       holds the ``agg_func`` aggregation over windows at that horizon index.
-    - **Time-aggregated metrics**: steps index backtest windows end-aligned
-      across series (``0 .. max_W-1``; shorter series skip early steps).
-      Standalone calls with a time axis but no window axis end-align timesteps
-      the same way across series of different lengths.
+    - **Time-aggregated metrics**: steps index backtest windows aligned across
+      series (``0 .. max_W-1``; shorter series skip early or late steps depending
+      on ``series_align``). Standalone calls with a time axis but no window axis
+      align timesteps the same way across series of different lengths.
 
-    Series can differ in length and overlap in time. We align from the end, not
-    the start: a shorter series contributes at the last steps/windows, not the
-    first. This matches the usual backtest layout but is an assumption — series
-    may also end at different calendar times.
+    Series can differ in length and overlap in time. By default
+    (``series_align="end"``), we align from the end: a shorter series contributes
+    at the last steps/windows, not the first. With ``series_align="start"``,
+    shorter series contribute at the first steps/windows instead. This matches
+    the usual backtest layout but is an assumption — series may also end at
+    different calendar times.
 
     Multi-series aggregation and artifacts
     ----------------------------------------
@@ -1313,6 +1363,11 @@ def _log_metric_results(
     are preserved (``component_reduction=None``), all series in a batch must
     have the same number of components; component names are taken from the first
     series.
+
+    When ``log_backtest_aggregate`` is enabled (backtest only), an additional
+    scalar per metric key is logged under ``backtest_agg_{metric_key}`` (e.g.
+    ``backtest_agg_mae``), computed as ``agg_func`` over all logged steps for
+    that key.
 
     Raises
     ------
@@ -1345,7 +1400,15 @@ def _log_metric_results(
         ``None``, the call is treated as standalone metric logging.
     agg_func
         Function used to aggregate per-series values at each ``(key, step)``.
-        Called as ``agg_func(values)`` on a list of floats.
+        Called as ``agg_func(values)`` on a list of floats. Also used to
+        collapse all logged steps into a single scalar when
+        ``log_backtest_aggregate`` is enabled.
+    series_align
+        How to align shorter series when multiple series differ in window or
+        time length. ``"end"`` (default) or ``"start"``.
+    log_backtest_aggregate
+        If ``True`` (backtest only), log an additional scalar per metric key
+        under ``backtest_agg_{metric_key}``.
     """
     metrics, metric_kwargs, metric_names = _normalize_metrics(
         metrics=metrics,
@@ -1427,6 +1490,7 @@ def _log_metric_results(
         has_time_axis=has_time_axis,
         has_windows=has_windows,
         last_points_only=last_points_only,
+        series_align=series_align,
     )
 
     write_table = (not series_reduced and not is_single_series) or (
@@ -1437,6 +1501,7 @@ def _log_metric_results(
         run_id,
         stepped_metrics,
         agg_func=agg_func,
+        log_backtest_aggregate=log_backtest_aggregate and is_backtest,
         table_rows=detailed_metrics if write_table else None,
     )
 
@@ -1718,20 +1783,22 @@ def _collect_stepped_and_detailed_metrics(
     has_time_axis: bool,
     has_windows: bool,
     last_points_only: bool,
+    series_align: Literal["start", "end"] = "end",
 ) -> tuple[dict[tuple[str, int], list[float]], list[dict]]:
     """Parse series metrics and build inputs for MLflow stepped metrics and detailed metric table.
 
     Each ``series_metrics`` array has shape ``(w_size, t_size, n_metrics * n_sub_metrics)``.
-    Shorter series are aligned from the end of the longest remaining axis (windows,
-    or time when there is no window axis).
+    Shorter series are aligned from the start or end of the longest remaining axis
+    (windows, or time when there is no window axis), controlled by ``series_align``.
 
     The MLflow ``step`` is the axis the UI should chart, always ``0 .. n-1``:
 
     - forecast-horizon index when a time axis is present (time-dependent metrics)
       - if windows are present: each horizon step is aggregated over the windows
       - if multi-series: each horizon step is aggregated over the series
-    - end-aligned window index otherwise (time-aggregated metrics)
-      - if multi-series: each window is aggregated over the series (end-aligned)
+    - window index otherwise (time-aggregated metrics), aligned across series
+      via ``series_align``
+      - if multi-series: each window is aggregated over the series
     """
     stepped_metrics: dict[tuple[str, int], list[float]] = {}
     detailed_metrics: list[dict] = []
@@ -1744,9 +1811,13 @@ def _collect_stepped_and_detailed_metrics(
         w_size = values.shape[w_axis]
         t_size = values.shape[t_axis]
 
-        # pad shorter series so their last point lines up with the longest
-        w_offset = max_w_size - w_size if has_windows else 0
-        t_offset = max_t_size - t_size if has_time_axis and not has_windows else 0
+        # pad shorter series so their last (end) or first (start) point lines up
+        if series_align == "end":
+            w_offset = max_w_size - w_size if has_windows else 0
+            t_offset = max_t_size - t_size if has_time_axis and not has_windows else 0
+        else:
+            w_offset = 0
+            t_offset = 0
 
         for metric_idx, sub_metric_keys in enumerate(metric_keys):
             for sub_metric_idx, key in enumerate(sub_metric_keys):
@@ -1788,6 +1859,7 @@ def _flush_logged_metrics(
     run_id: str,
     agg: dict[tuple[str, int], list[float]],
     agg_func: Callable,
+    log_backtest_aggregate: bool = False,
     table_rows: list[dict] | None = None,
 ) -> None:
     """Aggregate per-series cells, log MLflow metrics, and optionally write the
@@ -1803,15 +1875,32 @@ def _flush_logged_metrics(
         Map of ``(key, step) -> list of per-series float values``.
     agg_func
         Aggregation over the per-series values for each ``(key, step)``.
+    log_backtest_aggregate
+        If ``True``, log an additional scalar per backtest key under
+        ``backtest_agg_{metric_key}`` as ``agg_func`` over all logged steps.
     table_rows
         Granular cells for ``metrics_per_series.json``. ``None`` skips writing
         the table artifact.
     """
     metrics_by_step: dict[int, dict[str, float]] = {}
+    backtest_agg: dict[str, list[float]] = {}
     for (key, step), values in agg.items():
-        metrics_by_step.setdefault(step, {})[key] = float(agg_func(values))
+        step_agg = float(agg_func(values))
+        metrics_by_step.setdefault(step, {})[key] = step_agg
+
+        if log_backtest_aggregate and key.startswith("backtest_"):
+            agg_key = key.replace("backtest_", "backtest_agg_", 1)
+            backtest_agg.setdefault(agg_key, []).append(step_agg)
+
     for step, metrics in metrics_by_step.items():
         autologging_client.log_metrics(run_id=run_id, metrics=metrics, step=step)
+
+    if backtest_agg:
+        aggregate_metrics = {
+            agg_key: float(agg_func(step_values))
+            for agg_key, step_values in backtest_agg.items()
+        }
+        autologging_client.log_metrics(run_id=run_id, metrics=aggregate_metrics, step=0)
 
     if table_rows is not None:
         _log_per_series_table(table_rows)
@@ -1824,9 +1913,9 @@ def _log_per_series_table(rows: list[dict]) -> None:
     Each row is a single metric cell for one series, with columns ``key`` (the
     aggregate MLflow key, without any series suffix), ``series_index``, ``step``
     (the time or window index charted by MLflow), ``window_index`` (the
-    end-aligned source backtest window ``0 .. max_w - 1``, or ``None`` when
-    there is no window axis), and ``value``. All calls within a run append
-    to the same ``metrics_per_series.json`` artifact.
+    source backtest window ``0 .. max_w - 1`` aligned per ``series_align``, or
+    ``None`` when there is no window axis), and ``value``. All calls within a run
+    append to the same ``metrics_per_series.json`` artifact.
     Used when more than one series is scored, since the logged metric keys
     only carry the aggregate over series.
 
