@@ -15,7 +15,7 @@ but cannot always guarantee backwards compatibility. Changes that may **break co
   - Added `save_model()`, `load_model()`, and `log_model()` to persist and reload Darts models as MLflow models, including model and covariate metadata.
   - Added `autolog()` for model parameters, series/covariate metadata, optional model artifacts, PyTorch epoch metrics, and backtest metrics. Nested historical-forecast fits are suppressed.
   - Darts metrics are logged with shape-aware keys; multi-series and window-level backtest details are available in `metrics_per_series.json`.
-  - Added a new notebook for [MLflow quickstart](https://unit8co.github.io/darts/examples/29-MLflow-quickstart.html) with detailed usage examples.
+  - Added a new notebook for [MLflow quickstart](https://unit8co.github.io/darts/examples/29-MLflow-examples.html) with detailed usage examples.
   - Note: model serving and deployment (MLflow's `pyfunc` flavor, model signatures, and input examples) are not yet supported.
 - Added support for per-timestep (non-aggregated) encoder and decoder variable importances in `TFTExplainer`, exposed as `TimeSeries` via `TFTExplainabilityResult.get_encoder_importance_over_time()` and `get_decoder_importance_over_time()`. [#3170](https://github.com/unit8co/darts/pull/3170) by [exactml](https://github.com/exactml).
 - Calling `TFTModel.fit_from_dataset()` on a dataset that does not have future covariates now raises an informative exception. [#3149](https://github.com/unit8co/darts/pull/3149) by [YOON KIWOONG](https://github.com/kiwoongyoon).

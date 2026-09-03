@@ -8,7 +8,7 @@ Custom MLflow model flavor for Darts forecasting models. Supports saving, loadin
 and logging any Darts ``ForecastingModel`` (statistical, ML-based, and PyTorch-based)
 to MLflow, as well as automatic logging  via ``autolog()``.
 
-See the `MLflow quickstart example <https://github.com/unit8co/darts/blob/master/examples/29-MLflow-quickstart.ipynb>`_
+See the `MLflow quickstart example <https://github.com/unit8co/darts/blob/master/examples/29-MLflow-examples.ipynb>`_
 for an end-to-end walkthrough.
 
 .. dropdown:: Here's a quick start example
@@ -30,9 +30,16 @@ for an end-to-end walkthrough.
         # use a permanent location for real use cases
         tmpdir = tempfile.mkdtemp()
         mlflow_db = os.path.join(tmpdir, "mlflow.db")
+        artifact_root = os.path.join(tmpdir, "mlruns")
 
         mlflow.set_tracking_uri(f"sqlite:///{mlflow_db}")
-        mlflow.set_experiment("darts-quickstart")
+        # SQLite stores run metadata; artifacts default to ./mlruns unless we set a location
+        mlflow.set_experiment(
+            experiment_id=mlflow.create_experiment(
+                "darts-quickstart",
+                artifact_location=artifact_root,
+            )
+        )
 
         # load series and create train and val splits
         series = AirPassengersDataset().load()
@@ -110,9 +117,9 @@ an active MLflow run (e.g. within ``with mlflow.start_run():``):
     ``"mae_target0_q0_500"``), where each part is included only when the
     corresponding axis is present:
 
-    - ``metric_name`` – the metric function name, or the ``name`` metric
+    - ``metric_name`` - the metric function name, or the ``name`` metric
       keyword argument when provided (e.g., ``"mae"``).
-    - ``component`` – the component name: e.g., ``"_target0"`` when
+    - ``component`` - the component name: e.g., ``"_target0"`` when
       ``component_reduction=None``.
     - ``quantile_or_label``:
 
@@ -206,7 +213,7 @@ import numpy as np
 import pandas as pd
 import yaml
 from mlflow.entities import LoggedModel
-from mlflow.models import Model, ModelInputExample, ModelSignature
+from mlflow.models import Model, ModelSignature
 from mlflow.models.model import MLMODEL_FILE_NAME
 from mlflow.models.utils import _save_example
 from mlflow.tracking.artifact_utils import _download_artifact_from_uri
@@ -284,7 +291,7 @@ def save_model(
     code_paths: list[str] | None = None,
     mlflow_model: Model | None = None,
     signature: ModelSignature | None = None,
-    input_example: ModelInputExample | None = None,
+    input_example: Any | None = None,
     pip_requirements: list[str] | None = None,
     extra_pip_requirements: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
@@ -329,7 +336,7 @@ def save_model(
 
     Notes
     -----
-    Signature and input_example params are currently not supported, as they
+    ``signature`` and ``input_example`` params are currently not supported, as they
     are used to support serving and input validation in the MLflow pyfunc flavor,
     which is not implemented for Darts models. They are accepted as params for
     simplifying potential future extensibility, and to keep in line with MLflow API
@@ -850,10 +857,10 @@ def _mlflow_metric_callback(func, result, args, kwargs) -> None:
 
     where:
 
-    - ``metric_name`` – the metric function name, or the ``name`` keyword
+    - ``metric_name`` - the metric function name, or the ``name`` keyword
       argument when provided (it overrides only this token).
-    - ``component`` – ``_{component_name}`` when ``component_reduction=None``.
-    - ``quantile_or_label`` – quantile/interval/label suffix (e.g. ``_q0.500``,
+    - ``component`` - ``_{component_name}`` when ``component_reduction=None``.
+    - ``quantile_or_label`` - quantile/interval/label suffix (e.g. ``_q0.500``,
       ``_qi0.800``, ``_label1``) when applicable.
 
     When the input is a ``Sequence[TimeSeries]`` with more than one series, the
@@ -1124,7 +1131,7 @@ def _log_series_info(
 
 
 def _is_torch_model(model) -> bool:
-    """Check if a model is a `TorchForecastingModel`.
+    """Check if a model is a ``TorchForecastingModel``.
 
     Parameters
     ----------
@@ -1288,36 +1295,36 @@ def _log_metric_results(
     ----------------
     Each per-series result is reshaped to ``(W, T, C, M)``:
 
-    - ``W`` – backtest windows (``1`` for standalone, or when windows were
+    - ``W`` - backtest windows (``1`` for standalone, or when windows were
       aggregated before scoring).
-    - ``T`` – timesteps (``1`` when ``time_reduction`` is set).
-    - ``C`` – sub-metrics per component (components × quantiles / intervals /
+    - ``T`` - timesteps (``1`` when ``time_reduction`` is set).
+    - ``C`` - sub-metrics per component (components * quantiles / intervals /
       labels; ``1`` when ``component_reduction`` is set).
-    - ``M`` – number of metrics when several are logged at once.
+    - ``M`` - number of metrics when several are logged at once.
 
     Axis sizes are inferred from each metric's signature and the corresponding
     ``metric_kwargs``.
 
     Kwargs that affect output dimensions (both modes unless noted):
 
-    - ``time_reduction`` – collapses the time axis (``T=1``).
-    - ``component_reduction`` – collapses the component axis (``C=1``).
-    - ``q`` / ``q_interval`` – one sub-metric per quantile / interval.
-    - ``labels`` – when ``label_reduction=None``, one sub-metric per label;
+    - ``time_reduction`` - collapses the time axis (``T=1``).
+    - ``component_reduction`` - collapses the component axis (``C=1``).
+    - ``q`` / ``q_interval`` - one sub-metric per quantile / interval.
+    - ``labels`` - when ``label_reduction=None``, one sub-metric per label;
       otherwise ``labels`` only restricts which classes are scored.
-    - ``label_reduction`` – collapses label outputs to a scalar per component.
-    - ``series_reduction`` – collapses the series axis inside the metric, so
+    - ``label_reduction`` - collapses label outputs to a scalar per component.
+    - ``series_reduction`` - collapses the series axis inside the metric, so
       the caller's ``result`` is already aggregated and treated as a single
       series (``W=1`` for backtest regardless of ``reduction``).
 
     Backtest-only kwargs:
 
-    - ``reduction=None`` – no aggregation across windows → one value per
+    - ``reduction=None`` - no aggregation across windows → one value per
       window (``W > 1``).
-    - ``last_points_only`` – concatenates all windows into one ``TimeSeries``
+    - ``last_points_only`` - concatenates all windows into one ``TimeSeries``
       before scoring, so there is effectively one window regardless of
       ``reduction``.
-    - ``forecast_horizon`` / ``historical_forecasts`` – set the time-axis
+    - ``forecast_horizon`` / ``historical_forecasts`` - set the time-axis
       length for time-dependent metrics when windows are preserved.
 
     MLflow keys and steps
@@ -1596,10 +1603,10 @@ def _infer_metric_axes(
     tuple
         ``(has_time_axis, has_comp_axis, axis_labels)`` where
 
-        - ``has_time_axis`` – ``True`` when ``time_reduction`` is ``None`` (i.e. a
+        - ``has_time_axis`` - ``True`` when ``time_reduction`` is ``None`` (i.e. a
           per-timestep axis is present in the output).
-        - ``has_comp_axis`` – ``True`` when components are expanded (not collapsed to a scalar).
-        - ``axis_labels`` – one key suffix per quantile/interval/label entry.
+        - ``has_comp_axis`` - ``True`` when components are expanded (not collapsed to a scalar).
+        - ``axis_labels`` - one key suffix per quantile/interval/label entry.
 
     Raises
     ------
