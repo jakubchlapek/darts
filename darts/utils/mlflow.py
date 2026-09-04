@@ -86,14 +86,18 @@ an active MLflow run (e.g. within ``with mlflow.start_run():``):
   - Logs target series info and covariate usage information (past, future,
     and static covariates) as a ``series_info.json`` artifact.
   - Stores the trained model artifact when ``log_models=True`` (default:
-    ``False``).
+    ``False``), and sets ``darts.model_is_pretrained`` to ``True``.
   - Logs per-epoch training and validation metrics for PyTorch-based models.
 - Calling ``ForecastingModel.historical_forecasts(retrain=True)``:
 
   - Logs the same model creation parameters and ``series_info.json`` as
     ``fit()`` (overwriting any prior ``fit()`` artifacts in the same run).
-  - Does not log the trained model artifact; call ``fit()``
-    or ``log_model()`` manually if needed.
+  - Stores an untrained model template (via ``untrained_model()``) when
+    ``log_models=True`` and no model was logged yet in the run. Sets the run
+    tag and model metadata ``darts.model_is_pretrained`` to ``False`` so
+    downstream code knows the artifact must be refit before inference.
+    If a model was already logged (e.g. via ``fit()`` or manual
+    ``log_model()``), the existing artifact is kept unchanged.
 - Calling any Darts metric:
 
   - Logs the result of that metric call as an MLflow metric. More information
@@ -276,6 +280,7 @@ FLAVOR_NAME = "darts"
 
 _MODEL_FILE_STAT = "model.pkl"
 _MODEL_FILE_TORCH = "model.pt"
+_MODEL_IS_PRETRAINED_TAG = "darts.model_is_pretrained"
 
 # Thread-local flags used by _patched_fit to suppress nested/re-entrant
 # autologging: in_historical_forecasts covers historical_forecasts' internal
@@ -519,8 +524,11 @@ def autolog(
     Parameters
     ----------
     log_models
-        If ``True``, log the trained model artifact when calling ``fit()``.
-        Defaults to ``False``.
+        If ``True``, log a model artifact when calling ``fit()`` (trained
+        model) or ``historical_forecasts(retrain=True)`` (untrained template
+        via ``untrained_model()``). Defaults to ``False``. If a model was
+        already logged in the run (including via manual ``log_model()``),
+        autolog does not add another artifact.
     log_params
         If ``True`` (default), log model creation parameters when calling
         ``fit()`` or ``historical_forecasts()``.
@@ -706,35 +714,14 @@ def _autolog(
             future_covariates=fit_kwargs.get("future_covariates"),
             log_params=log_params,
         )
-
-        param_logging_ops = autologging_client.flush(synchronous=False)
-
-        if log_models:
-            model_name = type(self).__name__
-            model: LoggedModel = _initialize_logged_model(
-                name=model_name, flavor=FLAVOR_NAME
-            )
-            try:
-                registered_model_name = get_autologging_config(
-                    flavor_name=FLAVOR_NAME,
-                    config_key="registered_model_name",
-                    default_value=None,
-                )
-                log_model(
-                    result,
-                    name=model_name,
-                    registered_model_name=registered_model_name,
-                    model_id=model.model_id,
-                )
-            # TODO dennis: maybe let it fail naturally?
-            except Exception:
-                raise_log(
-                    ValueError(
-                        f"Failed to autolog model artifact for {type(self).__name__}."
-                    )
-                )
-
-        param_logging_ops.await_completion()
+        _log_model_artifact(
+            model=result,
+            run_id=run_id,
+            is_pretrained=True,
+            log_models=log_models,
+            autologging_client=autologging_client,
+        )
+        autologging_client.flush(synchronous=False).await_completion()
 
         return result
 
@@ -743,10 +730,11 @@ def _autolog(
         ``retrain=True``.
 
         Sets a thread-local flag so ``_patched_fit`` skips autologging for the
-        internal ``fit()`` calls. When ``retrain is True`` and an MLflow run is
+        internal ``fit()`` calls. When retraining is enabled and an MLflow run is
         active, logs model tags, creation parameters, and series info once after
         the call (overwriting any prior ``fit()`` artifacts in the same run).
-        Does not start a run and does not log the trained model artifact.
+        When ``log_models=True`` and no model exists yet in the run, also logs
+        an untrained model template with ``darts.model_is_pretrained=False``.
         """
         _autolog_state.in_historical_forecasts = True
         try:
@@ -760,18 +748,28 @@ def _autolog(
 
         bound = inspect.signature(original).bind(self, *args, **kwargs)
         bound.apply_defaults()
-        if bound.arguments["retrain"] is False:
+
+        retrain = bound.arguments["retrain"]
+        if retrain is False or retrain == 0:
             return result
 
+        run_id = active_run.info.run_id
         autologging_client = MlflowAutologgingQueueingClient()
         _log_model_setup(
             model=self,
             autologging_client=autologging_client,
-            run_id=active_run.info.run_id,
+            run_id=run_id,
             series=bound.arguments["series"],
             past_covariates=bound.arguments.get("past_covariates"),
             future_covariates=bound.arguments.get("future_covariates"),
             log_params=log_params,
+        )
+        _log_model_artifact(
+            model=self.untrained_model(),
+            run_id=run_id,
+            is_pretrained=False,
+            log_models=log_models,
+            autologging_client=autologging_client,
         )
         autologging_client.flush(synchronous=False).await_completion()
         return result
@@ -1009,6 +1007,58 @@ def _get_model_info_tags(
         "model_uses_future_covariates": uses_future,
         "model_uses_static_covariates": uses_static,
     }
+
+
+def _run_has_logged_model(run_id: str) -> bool:
+    """Return whether the given run already has a logged model artifact."""
+    if getattr(_autolog_state, "model_logged_run_id", None) == run_id:
+        return True
+    try:
+        run = mlflow.get_run(run_id)
+        return bool(run.outputs and run.outputs.model_outputs)
+    except Exception:
+        return False
+
+
+def _log_model_artifact(
+    *,
+    model: ForecastingModel,
+    run_id: str,
+    is_pretrained: bool,
+    log_models: bool,
+    autologging_client: MlflowAutologgingQueueingClient,
+) -> None:
+    """Log a Darts model artifact to the active run unless one already exists.
+
+    When autolog skips because the user already logged a model manually, the
+    existing artifact and any user-provided metadata/tags are left unchanged.
+    """
+    if not log_models or _run_has_logged_model(run_id):
+        return
+
+    model_name = type(model).__name__
+    logged_model: LoggedModel = _initialize_logged_model(
+        name=model_name, flavor=FLAVOR_NAME
+    )
+    metadata = {_MODEL_IS_PRETRAINED_TAG: str(is_pretrained)}
+    registered_model_name = get_autologging_config(
+        flavor_name=FLAVOR_NAME,
+        config_key="registered_model_name",
+        default_value=None,
+    )
+    log_model(
+        model,
+        name=model_name,
+        registered_model_name=registered_model_name,
+        model_id=logged_model.model_id,
+        metadata=metadata,
+    )
+
+    autologging_client.set_tags(
+        run_id=run_id,
+        tags={_MODEL_IS_PRETRAINED_TAG: str(is_pretrained)},
+    )
+    _autolog_state.model_logged_run_id = run_id
 
 
 def _log_model_setup(

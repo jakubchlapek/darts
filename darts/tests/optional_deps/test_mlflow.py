@@ -443,8 +443,8 @@ class TestMLflow:
     def test_autolog_historical_forecasts_series_info_covariates(
         self, mlflow_tracking, autolog_context, method
     ):
-        """HF and backtest without a prior fit() still reports model params and series_info
-        (but not the model artifact)."""
+        """HF and backtest without a prior fit() still reports model params and series_info,
+        and logs an untrained model template when log_models=True."""
         target = TS_UNIVARIATE.with_static_covariates(
             pd.DataFrame({"static_feat": [1.0]})
         )
@@ -478,17 +478,19 @@ class TestMLflow:
         assert tags["model_uses_future_covariates"] == "True"
         assert tags["model_uses_past_covariates"] == "True"
         assert tags["model_uses_static_covariates"] == "True"
+        assert tags["darts.model_is_pretrained"] == "False"
 
         params = mlflow.artifacts.load_dict(
             f"runs:/{run.info.run_id}/model_params.json"
         )
         assert params["lags"] == 5
 
-        # model artifact is not available
         logged_models = mlflow_tracking.search_logged_models(
             experiment_ids=[run.info.experiment_id]
         )
-        assert len(logged_models) == 0
+        assert len(logged_models) == 1
+        loaded_model = load_model(logged_models[0].model_uri)
+        assert loaded_model._fit_called is False
 
     def test_autolog_historical_forecasts_retrain_false_skips_model_setup(
         self, mlflow_tracking, autolog_context
@@ -530,6 +532,140 @@ class TestMLflow:
             f"runs:/{run.info.run_id}/series_info.json"
         )
         assert series_info["series"]["names"] == TS_MULTIVARIATE.components.tolist()
+
+    def test_autolog_historical_forecasts_retrain_logs_untrained_model(
+        self, mlflow_tracking, autolog_context
+    ):
+        """HF(retrain=True) without fit() logs an untrained model template."""
+        with autolog_context(log_models=True):
+            with mlflow.start_run() as run:
+                model = LinearRegressionModel(lags=5)
+                model.historical_forecasts(
+                    series=TS_UNIVARIATE,
+                    forecast_horizon=1,
+                    retrain=True,
+                    start=0.5,
+                )
+
+        logged_models = mlflow_tracking.search_logged_models(
+            experiment_ids=[run.info.experiment_id]
+        )
+        assert len(logged_models) == 1
+        assert logged_models[0].name == "LinearRegressionModel"
+
+        loaded_model = load_model(logged_models[0].model_uri)
+        assert loaded_model._fit_called is False
+
+        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
+        assert tags["darts.model_is_pretrained"] == "False"
+
+    def test_autolog_fit_then_historical_forecasts_logs_one_pretrained_model(
+        self, mlflow_tracking, autolog_context
+    ):
+        """fit() then HF(retrain=True) keeps the fit artifact and pretrained flag."""
+        with autolog_context(log_models=True):
+            with mlflow.start_run() as run:
+                model = LinearRegressionModel(lags=5)
+                model.fit(TS_UNIVARIATE[:30])
+                model.historical_forecasts(
+                    series=TS_UNIVARIATE,
+                    forecast_horizon=1,
+                    retrain=True,
+                    start=0.5,
+                )
+
+        logged_models = mlflow_tracking.search_logged_models(
+            experiment_ids=[run.info.experiment_id]
+        )
+        assert len(logged_models) == 1
+
+        loaded_model = load_model(logged_models[0].model_uri)
+        assert loaded_model._fit_called is True
+
+        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
+        assert tags["darts.model_is_pretrained"] == "True"
+
+    def test_autolog_manual_log_model_then_historical_forecasts(
+        self, mlflow_tracking, autolog_context
+    ):
+        """Manual log_model() before HF keeps the user's artifact only."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE[:30])
+
+        with autolog_context(log_models=True):
+            with mlflow.start_run() as run:
+                log_model(model, name="manual_model")
+                model.historical_forecasts(
+                    series=TS_UNIVARIATE,
+                    forecast_horizon=1,
+                    retrain=True,
+                    start=0.5,
+                )
+
+        logged_models = mlflow_tracking.search_logged_models(
+            experiment_ids=[run.info.experiment_id]
+        )
+        assert len(logged_models) == 1
+        assert logged_models[0].name == "manual_model"
+
+        loaded_model = load_model(logged_models[0].model_uri)
+        assert loaded_model._fit_called is True
+
+        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
+        assert "darts.model_is_pretrained" not in tags
+
+    def test_autolog_historical_forecasts_retrain_false_no_logged_model(
+        self, mlflow_tracking, autolog_context
+    ):
+        """historical_forecasts(retrain=False) does not log a model artifact."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE[:40])
+        with autolog_context(log_models=True):
+            with mlflow.start_run() as run:
+                model.historical_forecasts(
+                    series=TS_UNIVARIATE,
+                    forecast_horizon=1,
+                    retrain=False,
+                    start=0.5,
+                )
+
+        logged_models = mlflow_tracking.search_logged_models(
+            experiment_ids=[run.info.experiment_id]
+        )
+        assert len(logged_models) == 0
+
+    def test_autolog_ensemble_historical_forecasts_retrain_logs_once(
+        self, mlflow_tracking, autolog_context
+    ):
+        """Ensemble HF(retrain=True) logs exactly one untrained template."""
+        model = RegressionEnsembleModel(
+            forecasting_models=[
+                NaiveSeasonal(K=12),
+                LinearRegressionModel(lags=12),
+            ],
+            regression_train_n_points=12,
+        )
+
+        with autolog_context(log_models=True):
+            with mlflow.start_run() as run:
+                model.historical_forecasts(
+                    series=TS_UNIVARIATE,
+                    forecast_horizon=1,
+                    retrain=True,
+                    start=0.5,
+                )
+
+        logged_models = mlflow_tracking.search_logged_models(
+            experiment_ids=[run.info.experiment_id]
+        )
+        assert len(logged_models) == 1
+        assert logged_models[0].name == "RegressionEnsembleModel"
+
+        loaded_model = load_model(logged_models[0].model_uri)
+        assert loaded_model._fit_called is False
+
+        tags = mlflow.tracking.MlflowClient().get_run(run.info.run_id).data.tags
+        assert tags["darts.model_is_pretrained"] == "False"
 
     def test_multivariate_with_all_covariate_types(self, mlflow_tracking):
         """Test saving/loading multivariate series with all covariate types"""
