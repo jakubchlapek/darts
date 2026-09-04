@@ -2,8 +2,10 @@ import copy
 import itertools
 import logging
 import os
+import sys
 import uuid
 from contextlib import contextmanager
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -31,8 +33,12 @@ if not MLFLOW_AVAILABLE:
     )
 
 import mlflow
+import yaml
+from mlflow.models import ModelSignature
+from mlflow.types.schema import ColSpec, Schema
 from mlflow.utils.autologging_utils.client import MlflowAutologgingQueueingClient
 
+from darts.metrics.utils import unregister_metric_callback
 from darts.models import (
     ExponentialSmoothing,
     LinearRegressionModel,
@@ -44,7 +50,12 @@ from darts.utils.mlflow import (
     _flush_logged_metrics,
     _infer_metric_axes,
     _log_backtest_metrics,
+    _log_per_series_table,
+    _reshape_metric_result,
+    _resolve_backtest_layout,
+    _run_has_logged_model,
     autolog,
+    get_default_conda_env,
     load_model,
     log_model,
     save_model,
@@ -909,6 +920,143 @@ class TestMLflow:
         pred_loaded = loaded_model.predict(n=3, series=series)
         assert pred_original.width == pred_loaded.width
 
+    def test_save_model_invalid_model_type(self, tmp_path):
+        """save_model rejects non-ForecastingModel instances."""
+        with pytest.raises(ValueError, match="ForecastingModel"):
+            save_model(object(), str(tmp_path / "bad_model"))
+
+    def test_save_model_with_signature_metadata_and_input_example(self, tmp_path):
+        """Optional MLflow Model fields are persisted when provided."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE)
+
+        model_path = tmp_path / "test_model"
+        signature = ModelSignature(
+            inputs=Schema([ColSpec("double", "input")]),
+            outputs=Schema([ColSpec("double", "output")]),
+        )
+        metadata = {"author": "darts-test"}
+        save_model(
+            model,
+            str(model_path),
+            signature=signature,
+            input_example={"n": 3},
+            metadata=metadata,
+        )
+
+        with open(model_path / "MLmodel") as f:
+            mlmodel_conf = yaml.safe_load(f)
+        assert mlmodel_conf["signature"] is not None
+        assert mlmodel_conf["metadata"] == metadata
+        assert os.path.exists(model_path / "input_example.json")
+
+    def test_save_model_custom_pip_requirements(self, tmp_path):
+        """Explicit pip_requirements override the default dependency list."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE)
+
+        model_path = tmp_path / "test_model"
+        custom_reqs = ["numpy>=1.0"]
+        save_model(model, str(model_path), pip_requirements=custom_reqs)
+
+        with open(model_path / "requirements.txt") as f:
+            requirements = f.read()
+        assert "numpy>=1.0" in requirements
+
+    def test_save_model_pip_constraints(self, tmp_path):
+        """Constraint files referenced in pip_requirements are written out."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE)
+
+        constraints_file = tmp_path / "constraints.txt"
+        constraints_file.write_text("numpy>=1.0")
+
+        model_path = tmp_path / "test_model"
+        save_model(
+            model,
+            str(model_path),
+            pip_requirements=[f"-c {constraints_file}"],
+        )
+        assert (model_path / "constraints.txt").exists()
+
+    def test_load_model_non_forecasting_model_class(self, tmp_path):
+        """load_model rejects flavor configs whose model_class is not a ForecastingModel."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE)
+
+        model_path = tmp_path / "test_model"
+        save_model(model, str(model_path))
+
+        mlmodel_path = model_path / "MLmodel"
+        with open(mlmodel_path) as f:
+            mlmodel_conf = yaml.safe_load(f)
+        mlmodel_conf["flavors"]["darts"]["model_class"] = "builtins.str"
+        with open(mlmodel_path, "w") as f:
+            yaml.safe_dump(mlmodel_conf, f)
+
+        with pytest.raises(ValueError, match="ForecastingModel"):
+            load_model(f"file://{model_path}")
+
+    def test_get_default_conda_env(self):
+        """Default conda env includes darts as a pip dependency."""
+        env = get_default_conda_env()
+        assert env["name"] == "mlflow-env"
+        pip_deps = env["dependencies"][-1]["pip"]
+        assert any("darts" in dep for dep in pip_deps)
+
+    def test_autolog_invalid_series_align(self):
+        """autolog rejects unsupported series_align values."""
+        with pytest.raises(ValueError, match="series_align"):
+            autolog(series_align="middle")
+
+    def test_autolog_pytorch_import_error_is_ignored(self, autolog_context):
+        """Missing mlflow.pytorch does not break autolog when log_torch_metrics=True."""
+        real_import = __import__
+
+        def mock_import(name, *args, **kwargs):
+            if name == "mlflow.pytorch":
+                raise ImportError("no pytorch flavor")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=mock_import):
+            with autolog_context(log_torch_metrics=True):
+                with mlflow.start_run():
+                    LinearRegressionModel(lags=5).fit(TS_UNIVARIATE[:40])
+
+    def test_autolog_disable_pytorch_autolog_exception_is_ignored(self):
+        """Errors while disabling mlflow.pytorch autolog are swallowed."""
+        mock_pytorch = patch("mlflow.pytorch.autolog", side_effect=RuntimeError("boom"))
+        with mock_pytorch:
+            autolog(log_torch_metrics=True, disable=True)
+
+    def test_autolog_fit_no_active_run(self, autolog_context):
+        """fit() with autolog enabled but no active run completes without logging."""
+        with autolog_context(log_models=True):
+            model = LinearRegressionModel(lags=5)
+            model.fit(TS_UNIVARIATE[:40])
+
+        assert model._fit_called
+
+    def test_autolog_historical_forecasts_no_active_run(self, autolog_context):
+        """historical_forecasts(retrain=True) without a run does not raise."""
+        model = LinearRegressionModel(lags=5)
+        model.fit(TS_UNIVARIATE[:40])
+        with autolog_context(log_models=True):
+            model.historical_forecasts(
+                series=TS_UNIVARIATE,
+                forecast_horizon=1,
+                retrain=True,
+                start=0.5,
+            )
+
+    def test_autolog_backtest_no_active_run(self, autolog_context):
+        """backtest() with autolog enabled but no active run returns normally."""
+        with autolog_context(log_metrics=True):
+            ref = _fit_lr().backtest(
+                TS_UNIVARIATE, metric=dm.mae, retrain=False, start=-2
+            )
+        assert np.isfinite(float(np.asarray(ref).ravel()[0]))
+
 
 class TestAutoLogStandaloneMetrics:
     def test_autolog_metric_no_active_run(self, mlflow_tracking, autolog_context):
@@ -946,6 +1094,19 @@ class TestAutoLogStandaloneMetrics:
         assert "mape" not in run_data.metrics, (
             "mape should NOT be logged when log_metrics=False"
         )
+
+    def test_autolog_metric_series_reduction(self, mlflow_tracking, autolog_context):
+        """series_reduction collapses multi-series input to one logged scalar."""
+        series = [TS_UNIVARIATE, TS_UNIVARIATE * 1.2]
+        pred = [TS_UNIVARIATE * 1.1, TS_UNIVARIATE * 1.3]
+        with autolog_context(log_metrics=True):
+            with mlflow.start_run() as run:
+                ref = dm.mae(series, pred, series_reduction=np.mean)
+
+        assert np.isscalar(ref)
+        run_data = mlflow.get_run(run.info.run_id).data
+        assert "mae" in run_data.metrics
+        assert run_data.metrics["mae"] == pytest.approx(ref)
 
     def test_autolog_metric_any_import_path_logs(
         self, mlflow_tracking, autolog_context
@@ -1463,6 +1624,17 @@ class TestAutoLogBacktestMetrics:
         run_data = mlflow.get_run(run.info.run_id).data
         assert "backtest_mae" in run_data.metrics
         np.testing.assert_almost_equal(run_data.metrics["backtest_mae"], ref)
+
+    def test_autolog_backtest_log_metrics_false(self, mlflow_tracking, autolog_context):
+        """autolog(log_metrics=False) skips backtest metric logging."""
+        with autolog_context(log_metrics=False):
+            with mlflow.start_run() as run:
+                _fit_lr().backtest(
+                    TS_UNIVARIATE, metric=dm.mae, retrain=False, start=-2
+                )
+
+        run_data = mlflow.get_run(run.info.run_id).data
+        assert "backtest_mae" not in run_data.metrics
 
     def test_autolog_backtest_per_window_steps(self, mlflow_tracking, autolog_context):
         """reduction=None logs per-window values at steps."""
@@ -2400,3 +2572,88 @@ class TestAutoLogMetricHelperFunctions:
         assert logged[0] == pytest.approx(2.0)
         assert logged[1] == pytest.approx(20.0)
         assert m["backtest_agg_mae"] == pytest.approx(np.mean([2.0, 20.0]))
+
+    def test_resolve_backtest_layout_series_reduction_disables_windows(self):
+        """series_reduction in metric_kwargs collapses the window axis."""
+        backtest_kwargs = {
+            "last_points_only": False,
+            "reduction": None,
+            "forecast_horizon": 3,
+            "historical_forecasts": None,
+        }
+        has_windows, _ = _resolve_backtest_layout(
+            backtest_kwargs=backtest_kwargs,
+            metric=dm.mae,
+            metric_kwargs={"series_reduction": np.mean},
+            is_single_series=True,
+        )
+        assert has_windows is False
+
+    def test_reshape_metric_result_invalid_scalar_shape_raises(self):
+        """Mis-sized reduced results raise a descriptive ValueError."""
+        metric_keys = _build_metric_keys(
+            ["mae"],
+            TS_UNIVARIATE.components.tolist(),
+            has_comp_axis=False,
+            metric_axes=[(False, False, [""])],
+        )
+        with pytest.raises(ValueError, match="expected a single scalar"):
+            _reshape_metric_result(
+                TS_UNIVARIATE,
+                [1.0, 2.0],
+                metric_keys=metric_keys,
+                has_time_axis=False,
+                has_windows=False,
+                forecast_horizon=None,
+                is_backtest=True,
+            )
+
+    def test_log_per_series_table_skips_empty_rows(self, mlflow_tracking):
+        """An empty row list is a no-op and does not create an artifact."""
+        with mlflow.start_run() as run:
+            _log_per_series_table([])
+
+        artifacts = mlflow_tracking.list_artifacts(run.info.run_id)
+        assert not any(a.path == "metrics_per_series.json" for a in artifacts)
+
+    def test_run_has_logged_model_handles_get_run_failure(self, monkeypatch):
+        """_run_has_logged_model returns False when run lookup fails."""
+
+        def _fail_get_run(run_id):
+            raise RuntimeError("connection failed")
+
+        monkeypatch.setattr(mlflow, "get_run", _fail_get_run)
+        assert _run_has_logged_model("fake_run_id") is False
+
+    def test_unregister_metric_callback_missing_is_noop(self):
+        """unregister_metric_callback ignores callbacks that were never registered."""
+
+        def _dummy_callback(func, result, args, kwargs):
+            pass
+
+        unregister_metric_callback(_dummy_callback)
+
+
+def test_z_mlflow_import_without_dependency(monkeypatch):
+    """Importing darts.utils.mlflow without mlflow installed raises ImportError."""
+    import builtins
+    import importlib
+
+    mod_name = "darts.utils.mlflow"
+    saved = sys.modules.pop(mod_name, None)
+    real_import = builtins.__import__
+
+    def mock_import(name, *args, **kwargs):
+        if name == "mlflow":
+            raise ImportError("no mlflow")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", mock_import)
+    with pytest.raises(ImportError, match="mlflow"):
+        importlib.import_module(mod_name)
+
+    sys.modules.pop(mod_name, None)
+    if saved is not None:
+        sys.modules[mod_name] = saved
+    else:
+        importlib.import_module(mod_name)
